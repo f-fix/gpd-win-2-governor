@@ -68,7 +68,7 @@ def get_cpu_thermal_zone_path():
                         return os.path.join(base_path, zone, "temp")
     except Exception:
         pass
-    return "/sys/class/thermal/thermal_zone5/temp"
+    return "/sys/class/thermal/thermal_zone6/temp"
 
 def set_core1_state(online):
     for cpu in (1, 3):
@@ -120,8 +120,15 @@ def get_battery_metrics():
     return capacity, is_charging
 
 def restart_nbfc():
+    """Brings cores online temporarily to guarantee coretemp sensor re-binding."""
+    saved_state = check_core1_hardware_state()
+    set_core1_state(True)
+    subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.3)
     subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["systemctl", "restart", "nbfc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not saved_state:
+        time.sleep(0.5)
+        set_core1_state(False)
 
 def set_nbfc_fan(mode):
     cmd = ["/usr/bin/nbfc", "set", "-s", "100"] if mode == "100" else ["/usr/bin/nbfc", "set", "-a"]
@@ -242,6 +249,36 @@ def run_governor():
 # PART 2: EMBEDDED NAMESPACED PAYLOADS
 # =====================================================================
 
+NBFC_PRESTART_PAYLOAD = r"""#!/bin/sh
+# GPD Win 2 NBFC Pre-flight Sensor & Socket Initializer
+rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
+
+# Un-park cores so Intel coretemp DTS sensors are active
+for c in /sys/devices/system/cpu/cpu1/online /sys/devices/system/cpu/cpu3/online; do
+    if [ -f "$c" ]; then
+        echo 1 > "$c" 2>/dev/null || true
+    fi
+done
+
+modprobe coretemp 2>/dev/null || true
+
+# Wait up to 3 seconds for coretemp to appear in /sys/class/hwmon
+count=0
+while [ $count -lt 15 ]; do
+    for h in /sys/class/hwmon/hwmon*/name; do
+        if [ -f "$h" ]; then
+            if [ "$(cat "$h" 2>/dev/null)" = "coretemp" ]; then
+                exit 0
+            fi
+        fi
+    done
+    sleep 0.2
+    count=$((count + 1))
+done
+
+exit 0
+"""
+
 C_WATCHDOG_PAYLOAD = r"""#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -305,7 +342,7 @@ int is_target_hardware(void) {
 }
 
 void handle_signal(int sig) {
-    log_msg("Caught termination signal (%d). Exiting cleanly.", sig);
+    log_msg("Caught termination signal (%d). Restoring cores for systemd handoff.", sig);
     keep_running = 0;
 }
 
@@ -386,6 +423,11 @@ void apply_lowpower_profile(void) {
     write_sysfs("/sys/devices/system/cpu/cpu3/online", "0\n");
     write_sysfs("/sys/class/drm/card0/gt_max_freq_mhz", "300\n");
     log_msg("Low-power baseline enforced (1 Core, 30%% max, 300MHz GPU).");
+}
+
+void restore_full_cores(void) {
+    write_sysfs("/sys/devices/system/cpu/cpu1/online", "1\n");
+    write_sysfs("/sys/devices/system/cpu/cpu3/online", "1\n");
 }
 
 int scan_inputs(struct pollfd *fds, int max_fds) {
@@ -514,7 +556,8 @@ int main(void) {
         }
     }
 
-    log_msg("Handoff to rootfs: Preserving user brightness (%d) and closing descriptors.", user_brightness);
+    log_msg("Handoff to rootfs: Restoring full CPU cores for coretemp/systemd.");
+    restore_full_cores();
     set_brightness(user_brightness);
     for (int i = 0; i < num_fds; i++) {
         if (fds[i].fd >= 0) close(fds[i].fd);
@@ -528,6 +571,7 @@ int main(void) {
 LOWPOWER_PAYLOAD = r"""#!/usr/bin/env python3
 import sys
 import os
+import time
 import subprocess
 
 def ensure_root():
@@ -596,9 +640,11 @@ def ensure_nbfc_running():
     try:
         res = subprocess.run(["/usr/bin/nbfc", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
-            print("NBFC unresponsive. Restarting service...")
+            print("NBFC unresponsive. Bringing cores online to re-bind coretemp sensors...")
+            set_core1_state(True)
+            subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.3)
             subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["systemctl", "restart", "nbfc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             subprocess.run(["/usr/bin/nbfc", "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
@@ -626,12 +672,12 @@ if action == "on":
 
 elif action == "off":
     print("Restoring Adaptive Performance Mode (GPD Win 2)...")
+    set_core1_state(True)
     ensure_nbfc_running()
     if os.path.exists("/sys/class/drm/card0/gt_max_freq_mhz"):
         with open("/sys/class/drm/card0/gt_max_freq_mhz", "w") as f:
             f.write("850")
     set_turbo_state(True)
-    set_core1_state(True)
     apply_pstate_limit(100)
     subprocess.run(["systemctl", "start", "gpd-win-2-governor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("Adaptive governor restored via systemd.")
@@ -639,7 +685,7 @@ elif action == "off":
 
 GPD_GOVERNOR_SERVICE = """[Unit]
 Description=GPD Win 2 Dynamic Thermal Governor & Watchdog
-After=multi-user.target nbfc_service.service nbfc.service
+After=multi-user.target nbfc_service.service
 Wants=nbfc_service.service
 
 [Service]
@@ -694,18 +740,32 @@ def run_install():
     else:
         print("  [OK] nbfc binary already installed.")
 
+    # Ensure all cores are online for coretemp binding
+    set_core1_state(True)
+    subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open("/etc/modules-load.d/coretemp.conf", "w") as f:
+        f.write("coretemp\n")
+
+    # Install dedicated prestart helper script
+    prestart_bin = "/usr/local/bin/gpd-win-2-nbfc-prestart"
+    with open(prestart_bin, "w") as f:
+        f.write(NBFC_PRESTART_PAYLOAD)
+    os.chmod(prestart_bin, 0o755)
+
     nbfc_bin = shutil.which("nbfc") or "/usr/bin/nbfc"
+    nbfc_service_bin = shutil.which("nbfc_service") or "/usr/bin/nbfc_service"
     nbfc_service_content = f"""[Unit]
 Description=NoteBook FanControl service (nbfc-linux)
 After=syslog.target network.target
+StartLimitIntervalSec=0
 
 [Service]
-Type=forking
-ExecStart={nbfc_bin} start
-ExecStop={nbfc_bin} stop
-PIDFile=/run/nbfc_service.pid
+Type=simple
+ExecStartPre={prestart_bin}
+ExecStart={nbfc_service_bin}
+ExecStopPost=/bin/rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
 Restart=always
-RestartSec=2s
+RestartSec=3s
 
 [Install]
 WantedBy=multi-user.target
@@ -717,17 +777,16 @@ WantedBy=multi-user.target
         dpath = f"/etc/systemd/system/{svc}"
         os.makedirs(dpath, exist_ok=True)
         with open(f"{dpath}/restart.conf", "w") as f:
-            f.write("[Service]\nRestart=always\nRestartSec=2s\n")
+            f.write("[Service]\nRestart=always\nRestartSec=3s\n")
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
 
     if is_target_hardware():
         subprocess.run(["systemctl", "enable", "--now", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1)
-        res = subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        res = subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2 (8100y)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
-            subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2 (8100y)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run([nbfc_bin, "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # Step 3: Write & Compile Early Power Watchdog C binary
     print("[3/8] Compiling namespaced early_power_watchdog C micro-daemon...")
@@ -764,7 +823,7 @@ WantedBy=multi-user.target
 
     # Step 5: Enforce Initramfs Modules
     print("[5/8] Validating /etc/initramfs-tools/modules...")
-    required_modules = ["i915", "button", "i8042", "evdev", "intel_lpss_pci"]
+    required_modules = ["i915", "button", "i8042", "evdev", "intel_lpss_pci", "coretemp"]
     modules_file = "/etc/initramfs-tools/modules"
     existing = ""
     if os.path.exists(modules_file):
@@ -819,9 +878,9 @@ WantedBy=multi-user.target
     print(" * NBFC Service:      nbfc_service.service (Active & Supervised)")
     print(" * Watchdog Binary:   /usr/local/bin/gpd-win-2-power-watchdog")
     print(" * Governor Binary:   /usr/local/bin/gpd-win-2-governor")
-    print(" * Low-Power Toggle:  gpd-win-2-lowpower [on|off] (auto-elevates)")
+    print(" * Low-Power Toggle:  gpd-win-2-lowpower [on|off]")
     print(" * Systemd Unit:      gpd-win-2-governor.service")
-    print(" * Multi-Machine Safe: Bails out silently (0% CPU) on other hardware")
+    print(" * Sensor Linkage:    Auto-restores topology for coretemp binding")
     print("--------------------------------------------------------------------\n")
 
 # =====================================================================
