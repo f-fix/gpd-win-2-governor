@@ -28,19 +28,19 @@ This suite provides an all-in-one, self-installing architecture:
 │      - Automatically enforces 1-core 1.6GHz max & 300MHz GPU during boot                │
 │      - 30s Inactivity ──► Dims display to step floor (75 / 1%)                          │
 │      - 60s Inactivity ──► S3 Sleep (echo mem > /sys/power/state)                        │
-│      - Power Button Tap ──► Instant ACPI S5 Hardware Shutdown (reboot(RB_POWER_OFF))   │
+│      - Power Button Tap ──► Instant ACPI S5 Hardware Shutdown (reboot(RB_POWER_OFF))    │
 │      - Hotkey Brightness ──► 20-step GNOME-identical brightness curve with persistence  │
 └────────────────────────────────────────────┬────────────────────────────────────────────┘
                                              │ (LUKS Decryption Handover via init-bottom)
                                              ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
 │ 2. Post-Boot Runtime (Systemd Userland)                                                 │
-│    • gpd-win-2-governor.service (Python Staged Dynamic Governor)                         │
+│    • gpd-win-2-governor.service (Python Staged Dynamic Governor)                        │
 │      - Stage 1 (62°C): Disables Intel Turbo Boost globally via intel_pstate             │
 │      - Stage 2 (68°C): Cuts power to Core 1 (parks cpu1/cpu3) + blasts fan to 100%      │
 │      - Stage 2 Recovery (<= 59°C for 15s): Restores Core 1 + restores auto fan curve    │
 │      - Eco Automation: Single-core 30% perf ceiling if load < 0.20 or battery <= 10%    │
-│      - Self-Healing Watchdog: Supervises and auto-revives nbfc_service if it crashes     │
+│      - Self-Healing Watchdog: Supervises and auto-revives nbfc_service if it crashes    │
 │    • gpd-win-2-lowpower [on|off]                                                        │
 │      - Manual override clamping draw to ~1.5W baseline (>15 hours predicted runtime)    │
 │    • Multi-Machine Safe Guard                                                           │
