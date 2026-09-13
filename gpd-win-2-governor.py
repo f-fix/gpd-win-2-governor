@@ -835,8 +835,9 @@ def run_install():
             shutil.rmtree(tmp_dir)
         subprocess.run(["git", "clone", "https://github.com/nbfc-linux/nbfc-linux.git", tmp_dir], check=True)
 
-        # Patch Makefiles to disable Link-Time Optimization (-flto -> -fno-lto)
-        # Prevents internal compiler errors / illegal instruction crashes in GCC LTO (e.g. GCC 16 lto1 ICE)
+        # Patch Makefiles to:
+        # 1. Disable Link-Time Optimization (-flto -> -fno-lto) to prevent GCC LTO crashes (e.g. GCC 16 lto1 ICE)
+        # 2. Append -lm to link commands so roundf (used in src/client.c / src/nbfc) links libm cleanly
         for root, _, files in os.walk(tmp_dir):
             for fname in files:
                 if fname.startswith("Makefile") or fname.endswith(".mk"):
@@ -844,17 +845,27 @@ def run_install():
                     try:
                         with open(fpath, "r", errors="ignore") as mf:
                             mfc = mf.read()
+                        changed = False
                         if "-flto" in mfc:
                             mfc = mfc.replace("-flto", "-fno-lto")
+                            changed = True
+                        if "-ldl" in mfc:
+                            mfc = mfc.replace("-ldl", "-ldl -lm")
+                            changed = True
+                        elif "-lcurl" in mfc and "-lm" not in mfc:
+                            mfc = mfc.replace("-lcurl", "-lcurl -lm")
+                            changed = True
+                        if changed:
                             with open(fpath, "w") as mf:
                                 mf.write(mfc)
                     except Exception:
                         pass
         
-        # Prepare build environment with Lua include flags and LTO disabled
+        # Prepare build environment with Lua include flags, libm, and LTO disabled
         build_env = os.environ.copy()
         build_env["CFLAGS"] = ("-fno-lto " + build_env.get("CFLAGS", "")).strip()
-        build_env["LDFLAGS"] = ("-fno-lto " + build_env.get("LDFLAGS", "")).strip()
+        build_env["LDFLAGS"] = ("-lm -fno-lto " + build_env.get("LDFLAGS", "")).strip()
+        build_env["LDLIBS"] = ("-lm " + build_env.get("LDLIBS", "")).strip()
         lua_inc_dirs = []
         for d in ["/usr/include/lua5.4", "/usr/include/lua5.3", "/usr/include/lua5.2", "/usr/include/lua5.1", "/usr/include/luajit-2.1"]:
             if os.path.isfile(f"{d}/lua.h"):
