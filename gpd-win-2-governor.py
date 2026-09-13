@@ -257,7 +257,7 @@ NBFC_PRESTART_PAYLOAD = r"""#!/bin/sh
 # to prevent writing mismatched fan register offsets to a foreign Embedded Controller.
 # Exit code 77 tells systemd (EX_UNAVAILABLE) that the condition was not met,
 # deactivating the unit without marking it as failed or triggering restart loops.
-if ! grep -Eq '7Y30|m3-7Y30|8100Y|m3-8100Y' /proc/cpuinfo 2>/dev/null; then
+if ! grep -E -i -q '7y30|8100y' /proc/cpuinfo 2>/dev/null; then
     echo "[gpd-win-2-nbfc-prestart] Foreign hardware detected. Bailing out with code 77 to protect EC." >&2
     exit 77
 fi
@@ -711,16 +711,25 @@ def set_core1_state(online):
                 pass
 
 def ensure_nbfc_running():
+    nbfc_cli = shutil.which("nbfc") or "/usr/bin/nbfc"
     try:
-        res = subprocess.run(["/usr/bin/nbfc", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        res = subprocess.run([nbfc_cli, "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
             print("NBFC unresponsive. Bringing cores online to re-bind coretemp sensors...")
             set_core1_state(True)
+            # Ensure config file exists
+            if not os.path.exists("/etc/nbfc/nbfc.json"):
+                os.makedirs("/etc/nbfc", exist_ok=True)
+                cfg = "GPD Win 2 (8100y)" if is_target_hardware() and "8100" in open("/proc/cpuinfo").read() else "GPD Win 2"
+                with open("/etc/nbfc/nbfc.json", "w") as f:
+                    f.write(f'{{\n  "SelectedConfigId": "{cfg}",\n  "ReadOnly": false\n}}\n')
             subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.3)
             subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1.0)
+            subprocess.run([nbfc_cli, "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            subprocess.run(["/usr/bin/nbfc", "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([nbfc_cli, "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
@@ -973,13 +982,43 @@ WantedBy=multi-user.target
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
 
+    # Symlink binaries to /usr/bin if installed in /usr/local/bin
+    for b in ["nbfc", "nbfc_service"]:
+        p = shutil.which(b)
+        if p and p != f"/usr/bin/{b}":
+            try:
+                if not os.path.exists(f"/usr/bin/{b}"):
+                    os.symlink(p, f"/usr/bin/{b}")
+            except Exception:
+                pass
+
+    # Pre-generate /etc/nbfc/nbfc.json so nbfc_service has a valid profile on initial launch
+    os.makedirs("/etc/nbfc", exist_ok=True)
+    cfg_id = "GPD Win 2"
+    try:
+        with open("/proc/cpuinfo", "r") as f_cpu:
+            cinfo = f_cpu.read()
+        if "8100Y" in cinfo or "8100y" in cinfo:
+            cfg_id = "GPD Win 2 (8100y)"
+    except Exception:
+        pass
+
+    with open("/etc/nbfc/nbfc.json", "w") as f_cfg:
+        f_cfg.write(f'{{\n  "SelectedConfigId": "{cfg_id}",\n  "ReadOnly": false\n}}\n')
+    print(f"  [OK] Pre-configured NBFC profile: {cfg_id}")
+
     subprocess.run(["systemctl", "enable", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # Pre-configure Win 2 profile in NBFC
-    res = subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2 (8100y)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if res.returncode != 0:
-        subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if is_target_hardware():
-        subprocess.run(["systemctl", "start", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["systemctl", "restart", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Wait up to 3 seconds for UNIX socket to initialize
+        for _ in range(15):
+            if os.path.exists("/var/run/nbfc_service.socket") or os.path.exists("/run/nbfc_service.socket"):
+                break
+            time.sleep(0.2)
+        # Verify status
+        res = subprocess.run([nbfc_bin, "status"], capture_output=True, text=True)
+        if res.returncode == 0:
+            print(f"  [OK] nbfc_service is active and responding on UNIX socket.")
 
     # Step 3: Write & Compile Early Power Watchdog C binary
     print("[3/8] Compiling namespaced early_power_watchdog C micro-daemon...")
