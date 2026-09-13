@@ -148,6 +148,15 @@ def restart_nbfc():
                 f.write(cfg_payload)
         except Exception:
             pass
+    # Ensure ec_sys write support is enabled
+    if os.path.exists("/sys/module/ec_sys/parameters/write_support"):
+        try:
+            with open("/sys/module/ec_sys/parameters/write_support", "w") as f_ws:
+                f_ws.write("1\n")
+        except Exception:
+            pass
+    else:
+        subprocess.run(["modprobe", "ec_sys", "write_support=1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.3)
     subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -294,6 +303,13 @@ for c in /sys/devices/system/cpu/cpu1/online /sys/devices/system/cpu/cpu3/online
         echo 1 > "$c" 2>/dev/null || true
     fi
 done
+
+# Enable ec_sys write support for direct EC register manipulation
+if [ -f /sys/module/ec_sys/parameters/write_support ]; then
+    echo 1 > /sys/module/ec_sys/parameters/write_support 2>/dev/null || true
+else
+    modprobe ec_sys write_support=1 2>/dev/null || true
+fi
 
 modprobe coretemp 2>/dev/null || true
 
@@ -1069,6 +1085,24 @@ def run_install():
         print("  [OK] nbfc-linux compiled and installed.")
     else:
         print("  [OK] nbfc binary already installed.")
+
+    # Configure ec_sys write support so debugfs EC I/O allows writes
+    os.makedirs("/etc/modprobe.d", exist_ok=True)
+    with open("/etc/modprobe.d/ec_sys.conf", "w") as f_ec:
+        f_ec.write("options ec_sys write_support=1\n")
+    
+    os.makedirs("/etc/modules-load.d", exist_ok=True)
+    with open("/etc/modules-load.d/ec_sys.conf", "w") as f_ec:
+        f_ec.write("ec_sys\n")
+
+    if os.path.exists("/sys/module/ec_sys/parameters/write_support"):
+        try:
+            with open("/sys/module/ec_sys/parameters/write_support", "w") as f_ws:
+                f_ws.write("1\n")
+        except Exception:
+            pass
+    else:
+        subprocess.run(["modprobe", "ec_sys", "write_support=1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # Ensure all cores are online for coretemp binding
     set_core1_state(True)
