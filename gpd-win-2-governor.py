@@ -792,23 +792,37 @@ def run_install():
     print("[1/8] Verifying build dependencies...")
     has_binaries = all(shutil.which(p) is not None for p in ["gcc", "make", "git", "pkg-config"])
     has_ev = os.path.exists("/usr/include/ev.h") or (shutil.which("pkg-config") and subprocess.run(["pkg-config", "--exists", "libev"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
+    has_curl = os.path.exists("/usr/include/curl/curl.h") or (shutil.which("pkg-config") and subprocess.run(["pkg-config", "--exists", "libcurl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
+    has_ssl = os.path.exists("/usr/include/openssl/crypto.h") or os.path.exists("/usr/include/openssl/ssl.h") or (shutil.which("pkg-config") and subprocess.run(["pkg-config", "--exists", "openssl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
+    has_xml = os.path.exists("/usr/include/libxml2/libxml/parser.h") or os.path.exists("/usr/include/libxml/parser.h") or (shutil.which("pkg-config") and subprocess.run(["pkg-config", "--exists", "libxml-2.0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
     has_lua = any(os.path.exists(f"{p}/lua.h") for p in ["/usr/include", "/usr/include/lua5.4", "/usr/include/lua5.3", "/usr/include/lua5.2", "/usr/include/luajit-2.1"]) or (shutil.which("pkg-config") and any(subprocess.run(["pkg-config", "--exists", l], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 for l in ["lua5.4", "lua-5.4", "lua54", "lua5.3", "lua", "luajit"]))
 
-    if not (has_binaries and has_ev and has_lua):
+    if not (has_binaries and has_ev and has_curl and has_ssl and has_xml and has_lua):
         print("  Installing missing build toolchain and development headers via apt...")
         subprocess.run(["apt-get", "update", "-qq"], check=True)
-        base_pkgs = ["build-essential", "git", "gcc", "make", "pkg-config", "libev-dev"]
-        # Try installing with liblua5.4-dev, fallback to 5.3 or liblua-dev
+        core_pkgs = ["build-essential", "git", "gcc", "make", "pkg-config", "libev-dev", "libssl-dev", "libxml2-dev"]
+        curl_pkgs = ["libcurl4-openssl-dev", "libcurl4-gnutls-dev", "libcurl-dev"]
         lua_pkgs = ["liblua5.4-dev", "liblua5.3-dev", "liblua-dev"]
-        installed = False
-        for lpkg in lua_pkgs:
-            res = subprocess.run(["apt-get", "install", "-y", "-qq"] + base_pkgs + [lpkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if res.returncode == 0:
-                installed = True
-                print(f"  [OK] Installed dependencies including {lpkg}.")
+        
+        chosen_curl = "libcurl4-openssl-dev"
+        for cpkg in curl_pkgs:
+            r = subprocess.run(["apt-get", "install", "-y", "-qq", "--dry-run", cpkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode == 0:
+                chosen_curl = cpkg
                 break
-        if not installed:
-            subprocess.run(["apt-get", "install", "-y", "-qq"] + base_pkgs, check=True)
+
+        chosen_lua = "liblua5.4-dev"
+        for lpkg in lua_pkgs:
+            r = subprocess.run(["apt-get", "install", "-y", "-qq", "--dry-run", lpkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode == 0:
+                chosen_lua = lpkg
+                break
+
+        pkgs_to_install = core_pkgs + [chosen_curl, chosen_lua]
+        res = subprocess.run(["apt-get", "install", "-y", "-qq"] + pkgs_to_install, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode != 0:
+            subprocess.run(["apt-get", "install", "-y"] + pkgs_to_install, check=True)
+        print(f"  [OK] Installed dependencies ({chosen_curl}, {chosen_lua}, libxml2-dev, libssl-dev, libev-dev).")
     else:
         print("  [OK] Build toolchain and development libraries already present.")
 
