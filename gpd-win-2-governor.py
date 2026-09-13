@@ -124,6 +124,22 @@ def restart_nbfc():
     """Brings cores online temporarily to guarantee coretemp sensor re-binding."""
     saved_state = check_core1_hardware_state()
     set_core1_state(True)
+    os.makedirs("/etc/nbfc", exist_ok=True)
+    cfg = "GPD Win 2"
+    try:
+        with open("/proc/cpuinfo") as f_ci:
+            if "8100" in f_ci.read():
+                cfg = "GPD Win 2 (8100y)"
+    except Exception:
+        pass
+    cfg_json = f'{{\n  "SelectedConfigId": "{cfg}",\n  "ReadOnly": false\n}}\n'
+    for cfile in ["/etc/nbfc/nbfc_service.json", "/etc/nbfc/nbfc.json"]:
+        if not os.path.exists(cfile):
+            try:
+                with open(cfile, "w") as f:
+                    f.write(cfg_json)
+            except Exception:
+                pass
     subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.3)
     subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -132,7 +148,8 @@ def restart_nbfc():
         set_core1_state(False)
 
 def set_nbfc_fan(mode):
-    cmd = ["/usr/bin/nbfc", "set", "-s", "100"] if mode == "100" else ["/usr/bin/nbfc", "set", "-a"]
+    nbfc_cli = shutil.which("nbfc") or "/usr/local/bin/nbfc" or "/usr/bin/nbfc"
+    cmd = [nbfc_cli, "set", "-s", "100"] if mode == "100" else [nbfc_cli, "set", "-a"]
     try:
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
@@ -162,7 +179,8 @@ def run_governor():
         try:
             current_time = time.time()
             if current_time - last_nbfc_check > 15:
-                res = subprocess.run(["/usr/bin/nbfc", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                nbfc_cli = shutil.which("nbfc") or "/usr/local/bin/nbfc" or "/usr/bin/nbfc"
+                res = subprocess.run([nbfc_cli, "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if res.returncode != 0:
                     restart_nbfc()
                 last_nbfc_check = current_time
@@ -646,7 +664,9 @@ LOWPOWER_PAYLOAD = r"""#!/usr/bin/env python3
 import sys
 import os
 import time
+import glob
 import subprocess
+import shutil
 
 def ensure_root():
     if os.geteuid() != 0:
@@ -711,18 +731,26 @@ def set_core1_state(online):
                 pass
 
 def ensure_nbfc_running():
-    nbfc_cli = shutil.which("nbfc") or "/usr/bin/nbfc"
+    nbfc_cli = shutil.which("nbfc") or "/usr/local/bin/nbfc" or "/usr/bin/nbfc"
     try:
         res = subprocess.run([nbfc_cli, "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
             print("NBFC unresponsive. Bringing cores online to re-bind coretemp sensors...")
             set_core1_state(True)
-            # Ensure config file exists
-            if not os.path.exists("/etc/nbfc/nbfc.json"):
-                os.makedirs("/etc/nbfc", exist_ok=True)
-                cfg = "GPD Win 2 (8100y)" if is_target_hardware() and "8100" in open("/proc/cpuinfo").read() else "GPD Win 2"
-                with open("/etc/nbfc/nbfc.json", "w") as f:
-                    f.write(f'{{\n  "SelectedConfigId": "{cfg}",\n  "ReadOnly": false\n}}\n')
+            # Ensure config files exist in both locations
+            os.makedirs("/etc/nbfc", exist_ok=True)
+            cfg = "GPD Win 2"
+            try:
+                with open("/proc/cpuinfo") as f_ci:
+                    if "8100" in f_ci.read():
+                        cfg = "GPD Win 2 (8100y)"
+            except Exception:
+                pass
+            cfg_json = f'{{\n  "SelectedConfigId": "{cfg}",\n  "ReadOnly": false\n}}\n'
+            for cfile in ["/etc/nbfc/nbfc_service.json", "/etc/nbfc/nbfc.json"]:
+                if not os.path.exists(cfile):
+                    with open(cfile, "w") as f:
+                        f.write(cfg_json)
             subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.3)
             subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -733,13 +761,107 @@ def ensure_nbfc_running():
     except Exception:
         pass
 
-if len(sys.argv) < 2 or sys.argv[1].lower() not in ["on", "off"]:
-    print("Usage: gpd-win-2-lowpower [on|off]")
+def show_status():
+    print("--- GPD Win 2 (m3-7Y30 / m3-8100Y) Power Status ---")
+    # CPU Package Temp
+    temp_str = "Unknown"
+    for z in glob.glob("/sys/class/thermal/thermal_zone*/type"):
+        try:
+            with open(z) as f_zt:
+                if "x86_pkg_temp" in f_zt.read():
+                    tpath = os.path.join(os.path.dirname(z), "temp")
+                    with open(tpath) as f_tp:
+                        temp_str = f"{float(f_tp.read().strip()) / 1000.0:.1f}°C"
+                    break
+        except Exception:
+            pass
+    print(f" * CPU Package Temp:  {temp_str}")
+
+    # Core topology
+    c1_online = True
+    if os.path.exists("/sys/devices/system/cpu/cpu1/online"):
+        try:
+            with open("/sys/devices/system/cpu/cpu1/online") as f_c1:
+                c1_online = (f_c1.read().strip() == "1")
+        except Exception:
+            pass
+    print(f" * Core Topology:     {'Dual-Core (4 threads)' if c1_online else 'Single-Core (Core 1 Parked)'}")
+
+    # Intel Turbo Boost
+    no_turbo = "0"
+    if os.path.exists("/sys/devices/system/cpu/intel_pstate/no_turbo"):
+        try:
+            with open("/sys/devices/system/cpu/intel_pstate/no_turbo") as f_nt:
+                no_turbo = f_nt.read().strip()
+        except Exception:
+            pass
+    print(f" * Intel Turbo Boost: {'Disabled' if no_turbo == '1' else 'Enabled'}")
+
+    # P-State Max Perf
+    if os.path.exists("/sys/devices/system/cpu/intel_pstate/max_perf_pct"):
+        try:
+            with open("/sys/devices/system/cpu/intel_pstate/max_perf_pct") as f_mp:
+                print(f" * Max Perf Ceiling:  {f_mp.read().strip()}%")
+        except Exception:
+            pass
+
+    # Scaling Governor
+    if os.path.exists("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"):
+        try:
+            with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") as f_sg:
+                print(f" * Scaling Governor:  {f_sg.read().strip()}")
+        except Exception:
+            pass
+
+    # GPU Max Frequency
+    if os.path.exists("/sys/class/drm/card0/gt_max_freq_mhz"):
+        try:
+            with open("/sys/class/drm/card0/gt_max_freq_mhz") as f_gf:
+                print(f" * GPU Max Frequency: {f_gf.read().strip()} MHz")
+        except Exception:
+            pass
+
+    # Battery & Power
+    cap = "Unknown"
+    charging = "Unknown"
+    if os.path.exists("/sys/class/power_supply/BAT0/capacity"):
+        try:
+            with open("/sys/class/power_supply/BAT0/capacity") as f_cap:
+                cap = f"{f_cap.read().strip()}%"
+        except Exception:
+            pass
+    if os.path.exists("/sys/class/power_supply/AC/online"):
+        try:
+            with open("/sys/class/power_supply/AC/online") as f_ac:
+                charging = "Charging" if f_ac.read().strip() == "1" else "On Battery"
+        except Exception:
+            pass
+    print(f" * Battery & Power:   {cap} ({charging})")
+
+    # Governor Service
+    gov_active = subprocess.run(["systemctl", "is-active", "--quiet", "gpd-win-2-governor.service"]).returncode == 0
+    print(f" * Governor Service:  {'Active (Running)' if gov_active else 'Inactive / Overridden'}")
+
+    # NBFC Fan Status
+    nbfc_cli = shutil.which("nbfc") or "/usr/local/bin/nbfc" or "/usr/bin/nbfc"
+    res = subprocess.run([nbfc_cli, "status"], capture_output=True, text=True)
+    if res.returncode == 0:
+        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+        for l in lines:
+            print(f" * NBFC: {l}")
+    else:
+        print(" * NBFC Service:      Not responding on UNIX socket")
+
+if len(sys.argv) < 2 or sys.argv[1].lower() not in ["on", "off", "status"]:
+    print("Usage: gpd-win-2-lowpower [on|off|status]")
     sys.exit(1)
 
 action = sys.argv[1].lower()
 
-if action == "on":
+if action == "status":
+    show_status()
+
+elif action == "on":
     print("Entering Ultimate Low Power Mode (GPD Win 2)...")
     subprocess.run(["systemctl", "stop", "gpd-win-2-governor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["pkill", "-f", "gpd-win-2-governor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -992,7 +1114,7 @@ WantedBy=multi-user.target
             except Exception:
                 pass
 
-    # Pre-generate /etc/nbfc/nbfc.json so nbfc_service has a valid profile on initial launch
+    # Pre-generate configuration files in both paths so nbfc_service has a valid profile on initial launch
     os.makedirs("/etc/nbfc", exist_ok=True)
     cfg_id = "GPD Win 2"
     try:
@@ -1003,9 +1125,11 @@ WantedBy=multi-user.target
     except Exception:
         pass
 
-    with open("/etc/nbfc/nbfc.json", "w") as f_cfg:
-        f_cfg.write(f'{{\n  "SelectedConfigId": "{cfg_id}",\n  "ReadOnly": false\n}}\n')
-    print(f"  [OK] Pre-configured NBFC profile: {cfg_id}")
+    cfg_payload = f'{{\n  "SelectedConfigId": "{cfg_id}",\n  "ReadOnly": false\n}}\n'
+    for cpath in ["/etc/nbfc/nbfc_service.json", "/etc/nbfc/nbfc.json"]:
+        with open(cpath, "w") as f_cfg:
+            f_cfg.write(cfg_payload)
+    print(f"  [OK] Pre-configured NBFC profile: {cfg_id} (wrote nbfc_service.json & nbfc.json)")
 
     subprocess.run(["systemctl", "enable", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if is_target_hardware():
