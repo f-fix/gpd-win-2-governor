@@ -295,6 +295,7 @@ C_WATCHDOG_PAYLOAD = r"""#include <stdio.h>
 #include <sys/reboot.h>
 #include <sys/ioctl.h>
 #include <linux/input.h>
+#include <dirent.h>
 
 #define BACKLIGHT_PATH "/sys/class/backlight/intel_backlight"
 #define POWER_STATE_PATH "/sys/power/state"
@@ -456,8 +457,70 @@ int scan_inputs(struct pollfd *fds, int max_fds) {
     return num_fds;
 }
 
+
+static int is_fsck_running(void) {
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *ent;
+    int running = 0;
+    pid_t my_pid = getpid();
+
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] >= '0' && ent->d_name[0] <= '9') {
+            pid_t p = (pid_t)atoi(ent->d_name);
+            if (p == my_pid) continue;
+
+            char stat_path[512];
+            snprintf(stat_path, sizeof(stat_path), "/proc/%s/stat", ent->d_name);
+            FILE *f = fopen(stat_path, "r");
+            if (f) {
+                char buf[512];
+                if (fgets(buf, sizeof(buf), f)) {
+                    char *open_p = strchr(buf, '(');
+                    char *close_p = strrchr(buf, ')');
+                    if (open_p && close_p && close_p > open_p) {
+                        *close_p = '\0';
+                        char *comm = open_p + 1;
+                        char state = *(close_p + 2); // character right after ") "
+
+                        if (state != 'Z' && state != 'X') {
+                            if (strcmp(comm, "fsck") == 0 ||
+                                strncmp(comm, "fsck.", 5) == 0 ||
+                                strcmp(comm, "e2fsck") == 0 ||
+                                strcmp(comm, "dosfsck") == 0 ||
+                                strcmp(comm, "btrfsck") == 0 ||
+                                strcmp(comm, "xfs_repair") == 0) {
+                                running = 1;
+                                fclose(f);
+                                break;
+                            }
+                        }
+                    }
+                }
+                fclose(f);
+            }
+        }
+    }
+    closedir(d);
+    return running;
+}
+
 void power_off_immediate(void) {
-    log_msg("CRITICAL: Power button pressed! Blanking screen and issuing ACPI Poweroff...");
+    if (is_fsck_running()) {
+        log_msg("Power button pressed while fsck is active! Deferring shutdown until fsck finishes...");
+        int wait_count = 0;
+        while (is_fsck_running() && wait_count < 600) { // wait up to 60s
+            usleep(100000);
+            wait_count++;
+        }
+        if (wait_count >= 600) {
+            log_msg("WARNING: fsck wait timeout exceeded (60s). Proceeding with poweroff.");
+        } else {
+            log_msg("fsck finished cleanly. Proceeding with poweroff.");
+        }
+    }
+
+    log_msg("CRITICAL: Power button confirmed! Blanking screen and issuing ACPI Poweroff...");
     set_brightness(0);
     sync();
     reboot(RB_POWER_OFF);
