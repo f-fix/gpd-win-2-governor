@@ -145,8 +145,8 @@ def run_governor():
     ensure_root()
 
     if not is_target_hardware():
-        print("[gpd-win-2-governor] Non-GPD Win 2 hardware detected. Halting safely with 0% overhead.")
-        sys.exit(0)
+        print("[gpd-win-2-governor] Non-GPD Win 2 hardware detected. Halting safely with 0% overhead (status 77).")
+        sys.exit(77)
 
     print("GPD Win 2 Dynamic Thermal Governor Online.")
     CPU_TEMP_PATH = get_cpu_thermal_zone_path()
@@ -251,6 +251,16 @@ def run_governor():
 
 NBFC_PRESTART_PAYLOAD = r"""#!/bin/sh
 # GPD Win 2 NBFC Pre-flight Sensor & Socket Initializer
+# MULTI-MACHINE USB SAFETY GUARD:
+# Strictly abort if booted on non-Win 2 hardware (such as GPD Pocket 3 or other PCs)
+# to prevent writing mismatched fan register offsets to a foreign Embedded Controller.
+# Exit code 77 tells systemd (EX_UNAVAILABLE) that the condition was not met,
+# deactivating the unit without marking it as failed or triggering restart loops.
+if ! grep -Eq '7Y30|m3-7Y30|8100Y|m3-8100Y' /proc/cpuinfo 2>/dev/null; then
+    echo "[gpd-win-2-nbfc-prestart] Foreign hardware detected. Bailing out with code 77 to protect EC." >&2
+    exit 77
+fi
+
 rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
 
 # Un-park cores so Intel coretemp DTS sensors are active
@@ -753,6 +763,7 @@ Wants=nbfc_service.service
 
 [Service]
 Type=simple
+RestartPreventExitStatus=77
 ExecStart=/usr/local/bin/gpd-win-2-governor
 Restart=always
 RestartSec=3s
@@ -809,9 +820,27 @@ def run_install():
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir)
         subprocess.run(["git", "clone", "https://github.com/nbfc-linux/nbfc-linux.git", tmp_dir], check=True)
+
+        # Patch Makefiles to disable Link-Time Optimization (-flto -> -fno-lto)
+        # Prevents internal compiler errors / illegal instruction crashes in GCC LTO (e.g. GCC 16 lto1 ICE)
+        for root, _, files in os.walk(tmp_dir):
+            for fname in files:
+                if fname.startswith("Makefile") or fname.endswith(".mk"):
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, "r", errors="ignore") as mf:
+                            mfc = mf.read()
+                        if "-flto" in mfc:
+                            mfc = mfc.replace("-flto", "-fno-lto")
+                            with open(fpath, "w") as mf:
+                                mf.write(mfc)
+                    except Exception:
+                        pass
         
-        # Prepare build environment with Lua include flags
+        # Prepare build environment with Lua include flags and LTO disabled
         build_env = os.environ.copy()
+        build_env["CFLAGS"] = ("-fno-lto " + build_env.get("CFLAGS", "")).strip()
+        build_env["LDFLAGS"] = ("-fno-lto " + build_env.get("LDFLAGS", "")).strip()
         lua_inc_dirs = []
         for d in ["/usr/include/lua5.4", "/usr/include/lua5.3", "/usr/include/lua5.2", "/usr/include/lua5.1", "/usr/include/luajit-2.1"]:
             if os.path.isfile(f"{d}/lua.h"):
@@ -850,6 +879,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+RestartPreventExitStatus=77
 ExecStartPre={prestart_bin}
 ExecStart={nbfc_service_bin}
 ExecStopPost=/bin/rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
@@ -866,16 +896,17 @@ WantedBy=multi-user.target
         dpath = f"/etc/systemd/system/{svc}"
         os.makedirs(dpath, exist_ok=True)
         with open(f"{dpath}/restart.conf", "w") as f:
-            f.write("[Service]\nRestart=always\nRestartSec=3s\n")
+            f.write("[Service]\nRestart=always\nRestartSec=3s\nRestartPreventExitStatus=77\n")
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
 
+    subprocess.run(["systemctl", "enable", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Pre-configure Win 2 profile in NBFC
+    res = subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2 (8100y)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if res.returncode != 0:
+        subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if is_target_hardware():
-        subprocess.run(["systemctl", "enable", "--now", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1)
-        res = subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2 (8100y)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if res.returncode != 0:
-            subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["systemctl", "start", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # Step 3: Write & Compile Early Power Watchdog C binary
     print("[3/8] Compiling namespaced early_power_watchdog C micro-daemon...")
@@ -959,8 +990,9 @@ WantedBy=multi-user.target
         f.write(GPD_GOVERNOR_SERVICE)
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "gpd-win-2-governor.service"], check=True)
     if is_target_hardware():
-        subprocess.run(["systemctl", "enable", "--now", "gpd-win-2-governor.service"], check=True)
+        subprocess.run(["systemctl", "start", "gpd-win-2-governor.service"], check=True)
 
     print("\n[SUCCESS] Universal GPD Win 2 Stack Installed!")
     print("--------------------------------------------------------------------")
