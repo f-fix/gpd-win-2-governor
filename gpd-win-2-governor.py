@@ -865,30 +865,40 @@ def run_install():
                     try:
                         with open(fpath, "r", errors="ignore") as mf:
                             mfc = mf.read()
-                        changed = False
-                        if "-flto" in mfc:
-                            mfc = mfc.replace("-flto", "-fno-lto")
-                            changed = True
                         
-                        # Find Lua library flag used in the Makefile (e.g. -llua5.4, -llua5.3, -llua)
+                        # 1. Disable Link-Time Optimization (-flto -> -fno-lto)
+                        mfc = mfc.replace("-flto", "-fno-lto")
+
+                        # 2. Identify Lua library flag in Makefile (e.g. -llua5.4)
                         lua_lib_match = re.search(r"-llua[0-9.]*", mfc)
                         lua_lib_flag = lua_lib_match.group(0) if lua_lib_match else "-llua5.4"
 
-                        # Ensure ec_probe links Lua, libdl, and libm
-                        if "src/ec_probe" in mfc and lua_lib_flag not in mfc.split("src/ec_probe", 1)[1].split("\n", 1)[0]:
-                            # Replace '-o src/ec_probe' with '-o src/ec_probe <lua_flags> -ldl -lm'
-                            mfc = mfc.replace("-o src/ec_probe", f"-o src/ec_probe {lua_lib_flag} -ldl -lm")
-                            changed = True
-
-                        if "-ldl" in mfc and "-lm" not in mfc:
-                            mfc = mfc.replace("-ldl", "-ldl -lm")
-                            changed = True
-                        elif "-lcurl" in mfc and "-lm" not in mfc:
-                            mfc = mfc.replace("-lcurl", "-lcurl -lm")
-                            changed = True
-                        if changed:
-                            with open(fpath, "w") as mf:
-                                mf.write(mfc)
+                        # 3. Process line by line to append missing libraries to client and ec_probe
+                        patched_lines = []
+                        for line in mfc.splitlines():
+                            # Fix src/client (nbfc CLI): must link -lm for roundf
+                            if "src/client.c" in line or "-lcurl" in line:
+                                if "-lm" not in line:
+                                    if " -s" in line:
+                                        line = line.replace(" -s", " -lm -s")
+                                    else:
+                                        line = line + " -lm"
+                            
+                            # Fix src/ec_probe: must link Lua, dl, and m
+                            if "src/ec_probe.c" in line or "src/ec_probe" in line:
+                                if ("cc " in line or "$(CC)" in line or "gcc " in line) and "-o" in line:
+                                    if lua_lib_flag not in line:
+                                        line = line.replace("-o src/ec_probe", f"-o src/ec_probe {lua_lib_flag} -ldl -lm")
+                                    elif "-lm" not in line:
+                                        if " -s" in line:
+                                            line = line.replace(" -s", " -lm -s")
+                                        else:
+                                            line = line + " -lm"
+                            patched_lines.append(line)
+                        
+                        mfc = "\n".join(patched_lines) + "\n"
+                        with open(fpath, "w") as mf:
+                            mf.write(mfc)
                     except Exception as e:
                         print(f"  [WARNING] Makefile patch error on {fpath}: {e}")
         print("  [OK] Patched nbfc-linux sources (-fno-lto, ec_probe lua bindings, -lm).")
