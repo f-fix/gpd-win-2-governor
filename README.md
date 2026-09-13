@@ -174,3 +174,6 @@ If you install Debian onto an external SSD or USB drive and boot another PC (e.g
 ├── gpd-win-2-governor.service  # Systemd governor supervision unit
 └── nbfc_service.service        # Systemd NBFC fan control unit
 ```
+
+## Note on the code and the tools used to write it
+Parts of this code were written (including some initial ones that began in other, separate projects) with assistance from LLM-integrated coding tools. If you don't like it, feel free to use other software or rewrite parts you dislike. PRs are welcome!
