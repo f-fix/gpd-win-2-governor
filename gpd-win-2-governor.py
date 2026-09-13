@@ -841,20 +841,25 @@ def run_install():
         # 2. Fix missing lua bindings in src/ec_probe.c (upstream PR #183)
         # 3. Append -llua, -ldl, -lm to src/ec_probe link command and append -lm to src/nbfc
         
-        # Patch src/ec_probe.c if missing lua_bindings.c include
+        # Patch src/ec_probe.c:
+        # 1. Add missing lua_bindings.c include (upstream PR #183)
+        # 2. Fix static declaration of 'ec' following extern declaration in lua_bindings.c
         ec_probe_src = os.path.join(tmp_dir, "src", "ec_probe.c")
         if os.path.isfile(ec_probe_src):
             try:
                 with open(ec_probe_src, "r") as f_ec:
                     ec_content = f_ec.read()
                 if "lua_bindings.c" not in ec_content:
-                    # Include lua_bindings.c before model_config.c or at the top
                     if '#include "model_config.c"' in ec_content:
                         ec_content = ec_content.replace('#include "model_config.c"', '#include "lua_bindings.c"\n#include "model_config.c"')
                     else:
                         ec_content = '#include "lua_bindings.c"\n' + ec_content
-                    with open(ec_probe_src, "w") as f_ec:
-                        f_ec.write(ec_content)
+                
+                # Fix "static declaration of 'ec' follows non-static declaration"
+                ec_content = re.sub(r'static\s+const\s+EC_VTable\s*\*\s*ec\s*;', 'const EC_VTable* ec;', ec_content)
+                
+                with open(ec_probe_src, "w") as f_ec:
+                    f_ec.write(ec_content)
             except Exception as e:
                 print(f"  [WARNING] ec_probe.c patch error: {e}")
 
