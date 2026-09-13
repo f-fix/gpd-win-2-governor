@@ -779,14 +779,27 @@ def run_install():
 
     # Step 1: Install build prerequisites only if missing
     print("[1/8] Verifying build dependencies...")
-    pkgs = ["build-essential", "git", "gcc", "make", "pkg-config", "libev-dev"]
-    needs_apt = any(shutil.which(p) is None for p in ["gcc", "make", "git", "pkg-config"])
-    if needs_apt:
-        print("  Installing missing build packages via apt...")
+    has_binaries = all(shutil.which(p) is not None for p in ["gcc", "make", "git", "pkg-config"])
+    has_ev = os.path.exists("/usr/include/ev.h") or (shutil.which("pkg-config") and subprocess.run(["pkg-config", "--exists", "libev"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
+    has_lua = any(os.path.exists(f"{p}/lua.h") for p in ["/usr/include", "/usr/include/lua5.4", "/usr/include/lua5.3", "/usr/include/lua5.2", "/usr/include/luajit-2.1"]) or (shutil.which("pkg-config") and any(subprocess.run(["pkg-config", "--exists", l], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 for l in ["lua5.4", "lua-5.4", "lua54", "lua5.3", "lua", "luajit"]))
+
+    if not (has_binaries and has_ev and has_lua):
+        print("  Installing missing build toolchain and development headers via apt...")
         subprocess.run(["apt-get", "update", "-qq"], check=True)
-        subprocess.run(["apt-get", "install", "-y", "-qq"] + pkgs, check=True)
+        base_pkgs = ["build-essential", "git", "gcc", "make", "pkg-config", "libev-dev"]
+        # Try installing with liblua5.4-dev, fallback to 5.3 or liblua-dev
+        lua_pkgs = ["liblua5.4-dev", "liblua5.3-dev", "liblua-dev"]
+        installed = False
+        for lpkg in lua_pkgs:
+            res = subprocess.run(["apt-get", "install", "-y", "-qq"] + base_pkgs + [lpkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                installed = True
+                print(f"  [OK] Installed dependencies including {lpkg}.")
+                break
+        if not installed:
+            subprocess.run(["apt-get", "install", "-y", "-qq"] + base_pkgs, check=True)
     else:
-        print("  [OK] Build toolchain already present.")
+        print("  [OK] Build toolchain and development libraries already present.")
 
     # Step 2: Handle NBFC-Linux & Systemd Service
     print("[2/8] Setting up nbfc-linux & systemd unit...")
@@ -796,8 +809,21 @@ def run_install():
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir)
         subprocess.run(["git", "clone", "https://github.com/nbfc-linux/nbfc-linux.git", tmp_dir], check=True)
-        subprocess.run(["make", "-C", tmp_dir], check=True)
-        subprocess.run(["make", "-C", tmp_dir, "install"], check=True)
+        
+        # Prepare build environment with Lua include flags
+        build_env = os.environ.copy()
+        lua_inc_dirs = []
+        for d in ["/usr/include/lua5.4", "/usr/include/lua5.3", "/usr/include/lua5.2", "/usr/include/lua5.1", "/usr/include/luajit-2.1"]:
+            if os.path.isfile(f"{d}/lua.h"):
+                lua_inc_dirs.append(d)
+        if lua_inc_dirs:
+            inc_flag = " ".join(f"-I{d}" for d in lua_inc_dirs)
+            build_env["CFLAGS"] = (inc_flag + " " + build_env.get("CFLAGS", "")).strip()
+            build_env["C_INCLUDE_PATH"] = (":".join(lua_inc_dirs) + (":" + build_env["C_INCLUDE_PATH"] if "C_INCLUDE_PATH" in build_env else "")).strip(":")
+            build_env["CPATH"] = (":".join(lua_inc_dirs) + (":" + build_env["CPATH"] if "CPATH" in build_env else "")).strip(":")
+
+        subprocess.run(["make", "-C", tmp_dir], env=build_env, check=True)
+        subprocess.run(["make", "-C", tmp_dir, "install"], env=build_env, check=True)
         shutil.rmtree(tmp_dir)
         print("  [OK] nbfc-linux compiled and installed.")
     else:
