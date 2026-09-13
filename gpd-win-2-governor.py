@@ -14,6 +14,7 @@ import sys
 import time
 import subprocess
 import shutil
+import re
 
 # =====================================================================
 # PRIVILEGE ELEVATION & HARDWARE VALIDATION
@@ -854,8 +855,8 @@ def run_install():
                         ec_content = '#include "lua_bindings.c"\n' + ec_content
                     with open(ec_probe_src, "w") as f_ec:
                         f_ec.write(ec_content)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  [WARNING] ec_probe.c patch error: {e}")
 
         for root, _, files in os.walk(tmp_dir):
             for fname in files:
@@ -888,8 +889,9 @@ def run_install():
                         if changed:
                             with open(fpath, "w") as mf:
                                 mf.write(mfc)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"  [WARNING] Makefile patch error on {fpath}: {e}")
+        print("  [OK] Patched nbfc-linux sources (-fno-lto, ec_probe lua bindings, -lm).")
         
         # Prepare build environment with Lua include flags, libm, and LTO disabled
         build_env = os.environ.copy()
