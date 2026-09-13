@@ -835,9 +835,28 @@ def run_install():
             shutil.rmtree(tmp_dir)
         subprocess.run(["git", "clone", "https://github.com/nbfc-linux/nbfc-linux.git", tmp_dir], check=True)
 
-        # Patch Makefiles to:
+        # Patch nbfc-linux sources and Makefiles:
         # 1. Disable Link-Time Optimization (-flto -> -fno-lto) to prevent GCC LTO crashes (e.g. GCC 16 lto1 ICE)
-        # 2. Append -lm to link commands so roundf (used in src/client.c / src/nbfc) links libm cleanly
+        # 2. Fix missing lua bindings in src/ec_probe.c (upstream PR #183)
+        # 3. Append -llua, -ldl, -lm to src/ec_probe link command and append -lm to src/nbfc
+        
+        # Patch src/ec_probe.c if missing lua_bindings.c include
+        ec_probe_src = os.path.join(tmp_dir, "src", "ec_probe.c")
+        if os.path.isfile(ec_probe_src):
+            try:
+                with open(ec_probe_src, "r") as f_ec:
+                    ec_content = f_ec.read()
+                if "lua_bindings.c" not in ec_content:
+                    # Include lua_bindings.c before model_config.c or at the top
+                    if '#include "model_config.c"' in ec_content:
+                        ec_content = ec_content.replace('#include "model_config.c"', '#include "lua_bindings.c"\n#include "model_config.c"')
+                    else:
+                        ec_content = '#include "lua_bindings.c"\n' + ec_content
+                    with open(ec_probe_src, "w") as f_ec:
+                        f_ec.write(ec_content)
+            except Exception:
+                pass
+
         for root, _, files in os.walk(tmp_dir):
             for fname in files:
                 if fname.startswith("Makefile") or fname.endswith(".mk"):
@@ -849,7 +868,18 @@ def run_install():
                         if "-flto" in mfc:
                             mfc = mfc.replace("-flto", "-fno-lto")
                             changed = True
-                        if "-ldl" in mfc:
+                        
+                        # Find Lua library flag used in the Makefile (e.g. -llua5.4, -llua5.3, -llua)
+                        lua_lib_match = re.search(r"-llua[0-9.]*", mfc)
+                        lua_lib_flag = lua_lib_match.group(0) if lua_lib_match else "-llua5.4"
+
+                        # Ensure ec_probe links Lua, libdl, and libm
+                        if "src/ec_probe" in mfc and lua_lib_flag not in mfc.split("src/ec_probe", 1)[1].split("\n", 1)[0]:
+                            # Replace '-o src/ec_probe' with '-o src/ec_probe <lua_flags> -ldl -lm'
+                            mfc = mfc.replace("-o src/ec_probe", f"-o src/ec_probe {lua_lib_flag} -ldl -lm")
+                            changed = True
+
+                        if "-ldl" in mfc and "-lm" not in mfc:
                             mfc = mfc.replace("-ldl", "-ldl -lm")
                             changed = True
                         elif "-lcurl" in mfc and "-lm" not in mfc:
