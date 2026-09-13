@@ -125,21 +125,29 @@ def restart_nbfc():
     saved_state = check_core1_hardware_state()
     set_core1_state(True)
     os.makedirs("/etc/nbfc", exist_ok=True)
-    cfg = "GPD Win 2"
-    try:
-        with open("/proc/cpuinfo") as f_ci:
-            if "8100" in f_ci.read():
-                cfg = "GPD Win 2 (8100y)"
-    except Exception:
-        pass
-    cfg_json = f'{{\n  "SelectedConfigId": "{cfg}",\n  "ReadOnly": false\n}}\n'
+    # Ensure config symlink exists so both "GPD Win 2" and "GPD Win 2 (8100y)" resolve
+    for cdir in ["/usr/share/nbfc/configs", "/etc/nbfc/configs"]:
+        if os.path.isdir(cdir):
+            f_81 = os.path.join(cdir, "GPD Win 2 (8100y).json")
+            f_pl = os.path.join(cdir, "GPD Win 2.json")
+            if os.path.isfile(f_81) and not os.path.exists(f_pl):
+                try:
+                    os.symlink("GPD Win 2 (8100y).json", f_pl)
+                except Exception:
+                    pass
+            elif os.path.isfile(f_pl) and not os.path.exists(f_81):
+                try:
+                    os.symlink("GPD Win 2.json", f_81)
+                except Exception:
+                    pass
+    cfg = "GPD Win 2 (8100y)"
+    cfg_payload = '{\n  "SelectedConfigId": "' + cfg + '"\n}\n'
     for cfile in ["/etc/nbfc/nbfc_service.json", "/etc/nbfc/nbfc.json"]:
-        if not os.path.exists(cfile):
-            try:
-                with open(cfile, "w") as f:
-                    f.write(cfg_json)
-            except Exception:
-                pass
+        try:
+            with open(cfile, "w") as f:
+                f.write(cfg_payload)
+        except Exception:
+            pass
     subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.3)
     subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -148,8 +156,7 @@ def restart_nbfc():
         set_core1_state(False)
 
 def set_nbfc_fan(mode):
-    nbfc_cli = shutil.which("nbfc") or "/usr/local/bin/nbfc" or "/usr/bin/nbfc"
-    cmd = [nbfc_cli, "set", "-s", "100"] if mode == "100" else [nbfc_cli, "set", "-a"]
+    cmd = ["/usr/bin/nbfc", "set", "-s", "100"] if mode == "100" else ["/usr/bin/nbfc", "set", "-a"]
     try:
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
@@ -179,8 +186,7 @@ def run_governor():
         try:
             current_time = time.time()
             if current_time - last_nbfc_check > 15:
-                nbfc_cli = shutil.which("nbfc") or "/usr/local/bin/nbfc" or "/usr/bin/nbfc"
-                res = subprocess.run([nbfc_cli, "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                res = subprocess.run(["/usr/bin/nbfc", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if res.returncode != 0:
                     restart_nbfc()
                 last_nbfc_check = current_time
@@ -737,20 +743,27 @@ def ensure_nbfc_running():
         if res.returncode != 0:
             print("NBFC unresponsive. Bringing cores online to re-bind coretemp sensors...")
             set_core1_state(True)
-            # Ensure config files exist in both locations
+            # Ensure config symlinks exist in configs directory
+            for cdir in ["/usr/share/nbfc/configs", "/etc/nbfc/configs"]:
+                if os.path.isdir(cdir):
+                    f_81 = os.path.join(cdir, "GPD Win 2 (8100y).json")
+                    f_pl = os.path.join(cdir, "GPD Win 2.json")
+                    if os.path.isfile(f_81) and not os.path.exists(f_pl):
+                        try:
+                            os.symlink("GPD Win 2 (8100y).json", f_pl)
+                        except Exception:
+                            pass
+                    elif os.path.isfile(f_pl) and not os.path.exists(f_81):
+                        try:
+                            os.symlink("GPD Win 2.json", f_81)
+                        except Exception:
+                            pass
             os.makedirs("/etc/nbfc", exist_ok=True)
-            cfg = "GPD Win 2"
-            try:
-                with open("/proc/cpuinfo") as f_ci:
-                    if "8100" in f_ci.read():
-                        cfg = "GPD Win 2 (8100y)"
-            except Exception:
-                pass
-            cfg_json = f'{{\n  "SelectedConfigId": "{cfg}",\n  "ReadOnly": false\n}}\n'
+            cfg = "GPD Win 2 (8100y)"
+            cfg_json = f'{{\n  "SelectedConfigId": "{cfg}"\n}}\n'
             for cfile in ["/etc/nbfc/nbfc_service.json", "/etc/nbfc/nbfc.json"]:
-                if not os.path.exists(cfile):
-                    with open(cfile, "w") as f:
-                        f.write(cfg_json)
+                with open(cfile, "w") as f:
+                    f.write(cfg_json)
             subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.3)
             subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -763,7 +776,6 @@ def ensure_nbfc_running():
 
 def show_status():
     print("--- GPD Win 2 (m3-7Y30 / m3-8100Y) Power Status ---")
-    # CPU Package Temp
     temp_str = "Unknown"
     for z in glob.glob("/sys/class/thermal/thermal_zone*/type"):
         try:
@@ -777,7 +789,6 @@ def show_status():
             pass
     print(f" * CPU Package Temp:  {temp_str}")
 
-    # Core topology
     c1_online = True
     if os.path.exists("/sys/devices/system/cpu/cpu1/online"):
         try:
@@ -787,7 +798,6 @@ def show_status():
             pass
     print(f" * Core Topology:     {'Dual-Core (4 threads)' if c1_online else 'Single-Core (Core 1 Parked)'}")
 
-    # Intel Turbo Boost
     no_turbo = "0"
     if os.path.exists("/sys/devices/system/cpu/intel_pstate/no_turbo"):
         try:
@@ -797,7 +807,6 @@ def show_status():
             pass
     print(f" * Intel Turbo Boost: {'Disabled' if no_turbo == '1' else 'Enabled'}")
 
-    # P-State Max Perf
     if os.path.exists("/sys/devices/system/cpu/intel_pstate/max_perf_pct"):
         try:
             with open("/sys/devices/system/cpu/intel_pstate/max_perf_pct") as f_mp:
@@ -805,7 +814,6 @@ def show_status():
         except Exception:
             pass
 
-    # Scaling Governor
     if os.path.exists("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"):
         try:
             with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") as f_sg:
@@ -813,7 +821,6 @@ def show_status():
         except Exception:
             pass
 
-    # GPU Max Frequency
     if os.path.exists("/sys/class/drm/card0/gt_max_freq_mhz"):
         try:
             with open("/sys/class/drm/card0/gt_max_freq_mhz") as f_gf:
@@ -821,7 +828,6 @@ def show_status():
         except Exception:
             pass
 
-    # Battery & Power
     cap = "Unknown"
     charging = "Unknown"
     if os.path.exists("/sys/class/power_supply/BAT0/capacity"):
@@ -830,19 +836,21 @@ def show_status():
                 cap = f"{f_cap.read().strip()}%"
         except Exception:
             pass
-    if os.path.exists("/sys/class/power_supply/AC/online"):
+    if os.path.exists("/sys/class/power_supply/BAT0/status"):
         try:
-            with open("/sys/class/power_supply/AC/online") as f_ac:
-                charging = "Charging" if f_ac.read().strip() == "1" else "On Battery"
+            charging = open("/sys/class/power_supply/BAT0/status").read().strip()
+        except Exception:
+            pass
+    elif os.path.exists("/sys/class/power_supply/AC/online"):
+        try:
+            charging = "Charging" if open("/sys/class/power_supply/AC/online").read().strip() == "1" else "On Battery"
         except Exception:
             pass
     print(f" * Battery & Power:   {cap} ({charging})")
 
-    # Governor Service
     gov_active = subprocess.run(["systemctl", "is-active", "--quiet", "gpd-win-2-governor.service"]).returncode == 0
     print(f" * Governor Service:  {'Active (Running)' if gov_active else 'Inactive / Overridden'}")
 
-    # NBFC Fan Status
     nbfc_cli = shutil.which("nbfc") or "/usr/local/bin/nbfc" or "/usr/bin/nbfc"
     res = subprocess.run([nbfc_cli, "status"], capture_output=True, text=True)
     if res.returncode == 0:
@@ -1114,22 +1122,64 @@ WantedBy=multi-user.target
             except Exception:
                 pass
 
-    # Pre-generate configuration files in both paths so nbfc_service has a valid profile on initial launch
-    os.makedirs("/etc/nbfc", exist_ok=True)
-    cfg_id = "GPD Win 2"
-    try:
-        with open("/proc/cpuinfo", "r") as f_cpu:
-            cinfo = f_cpu.read()
-        if "8100Y" in cinfo or "8100y" in cinfo:
-            cfg_id = "GPD Win 2 (8100y)"
-    except Exception:
-        pass
+    # Ensure profile symlink so both 'GPD Win 2.json' and 'GPD Win 2 (8100y).json' exist
+    for cfg_dir in ["/usr/share/nbfc/configs", "/etc/nbfc/configs"]:
+        if os.path.isdir(cfg_dir):
+            f_8100y = os.path.join(cfg_dir, "GPD Win 2 (8100y).json")
+            f_plain = os.path.join(cfg_dir, "GPD Win 2.json")
+            if os.path.isfile(f_8100y) and not os.path.exists(f_plain):
+                try:
+                    os.symlink("GPD Win 2 (8100y).json", f_plain)
+                    print(f"  [OK] Symlinked {f_plain} -> GPD Win 2 (8100y).json")
+                except Exception:
+                    pass
+            elif os.path.isfile(f_plain) and not os.path.exists(f_8100y):
+                try:
+                    os.symlink("GPD Win 2.json", f_8100y)
+                    print(f"  [OK] Symlinked {f_8100y} -> GPD Win 2.json")
+                except Exception:
+                    pass
 
-    cfg_payload = f'{{\n  "SelectedConfigId": "{cfg_id}",\n  "ReadOnly": false\n}}\n'
+    # Set default config to GPD Win 2 (8100y) which exists in nbfc-linux and applies to all Win 2 revisions
+    os.makedirs("/etc/nbfc", exist_ok=True)
+    cfg_id = "GPD Win 2 (8100y)"
+    cfg_payload = '{\n  "SelectedConfigId": "' + cfg_id + '"\n}\n'
     for cpath in ["/etc/nbfc/nbfc_service.json", "/etc/nbfc/nbfc.json"]:
         with open(cpath, "w") as f_cfg:
             f_cfg.write(cfg_payload)
     print(f"  [OK] Pre-configured NBFC profile: {cfg_id} (wrote nbfc_service.json & nbfc.json)")
+
+    # Multi-Machine Safety Lock: Wrap nbfc_service at binary level so it CANNOT run on foreign hardware
+    wrapper_script = """#!/bin/sh
+# GPD WIN 2 HARDWARE SAFETY LOCK
+# Strictly abort if booted on non-Win 2 hardware (such as GPD Pocket 3 or other PCs)
+# to prevent writing mismatched fan register offsets to a foreign Embedded Controller.
+if ! grep -E -i -q '7y30|8100y' /proc/cpuinfo 2>/dev/null; then
+    echo "[ERROR] nbfc_service is hardware-locked to GPD Win 2. Aborting to protect foreign EC." >&2
+    exit 77
+fi
+TARGET_REAL="$(dirname "$0")/nbfc_service.real"
+if [ ! -x "$TARGET_REAL" ]; then
+    TARGET_REAL="/usr/local/bin/nbfc_service.real"
+fi
+exec "$TARGET_REAL" "$@"
+"""
+    for bdir in ["/usr/local/bin", "/usr/bin"]:
+        real_bin = os.path.join(bdir, "nbfc_service")
+        target_real = os.path.join(bdir, "nbfc_service.real")
+        if os.path.isfile(real_bin) and not os.path.islink(real_bin):
+            try:
+                with open(real_bin, "rb") as f_chk:
+                    hdr = f_chk.read(16)
+                if not hdr.startswith(b"#!/bin/sh"):
+                    os.replace(real_bin, target_real)
+                    os.chmod(target_real, 0o755)
+                    with open(real_bin, "w") as f_wrp:
+                        f_wrp.write(wrapper_script)
+                    os.chmod(real_bin, 0o755)
+                    print(f"  [OK] Applied hardware safety lock wrapper to {real_bin}")
+            except Exception as e:
+                print(f"  [WARNING] Could not wrap {real_bin}: {e}")
 
     subprocess.run(["systemctl", "enable", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if is_target_hardware():
