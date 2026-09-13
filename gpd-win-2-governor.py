@@ -873,20 +873,21 @@ def run_install():
                         lua_lib_match = re.search(r"-llua[0-9.]*", mfc)
                         lua_lib_flag = lua_lib_match.group(0) if lua_lib_match else "-llua5.4"
 
-                        # 3. Process line by line to append missing libraries to client and ec_probe
+                        # 3. Process line by line to append missing libraries ONLY to compiler recipe lines (not target/prerequisite lines)
                         patched_lines = []
                         for line in mfc.splitlines():
-                            # Fix src/client (nbfc CLI): must link -lm for roundf
-                            if "src/client.c" in line or "-lcurl" in line:
-                                if "-lm" not in line:
-                                    if " -s" in line:
-                                        line = line.replace(" -s", " -lm -s")
-                                    else:
-                                        line = line + " -lm"
-                            
-                            # Fix src/ec_probe: must link Lua, dl, and m
-                            if "src/ec_probe.c" in line or "src/ec_probe" in line:
-                                if ("cc " in line or "$(CC)" in line or "gcc " in line) and "-o" in line:
+                            is_recipe = (line.startswith("\t") or "cc " in line or "$(CC)" in line or "gcc " in line) and "-o " in line
+                            if is_recipe:
+                                # Fix src/client (nbfc CLI): must link -lm for roundf
+                                if "src/client.c" in line or "src/nbfc" in line or "-lcurl" in line:
+                                    if "-lm" not in line:
+                                        if " -s" in line:
+                                            line = line.replace(" -s", " -lm -s")
+                                        else:
+                                            line = line + " -lm"
+                                
+                                # Fix src/ec_probe: must link Lua, dl, and m
+                                if "src/ec_probe.c" in line or "src/ec_probe" in line:
                                     if lua_lib_flag not in line:
                                         line = line.replace("-o src/ec_probe", f"-o src/ec_probe {lua_lib_flag} -ldl -lm")
                                     elif "-lm" not in line:
