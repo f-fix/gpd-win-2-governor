@@ -179,30 +179,107 @@ def get_battery_metrics():
     return capacity, is_charging
 
 
+def get_nbfc_bin():
+    return (
+        shutil.which("nbfc")
+        or (os.path.exists("/usr/local/bin/nbfc") and "/usr/local/bin/nbfc")
+        or (os.path.exists("/usr/bin/nbfc") and "/usr/bin/nbfc")
+        or "nbfc"
+    )
+
+
+def get_nbfc_service_bin():
+    return (
+        shutil.which("nbfc_service")
+        or (
+            os.path.exists("/usr/local/bin/nbfc_service")
+            and "/usr/local/bin/nbfc_service"
+        )
+        or (os.path.exists("/usr/bin/nbfc_service") and "/usr/bin/nbfc_service")
+        or "nbfc_service"
+    )
+
+
 def restart_nbfc():
-    """Brings cores online temporarily to guarantee coretemp sensor re-binding."""
+    """Brings cores online temporarily to guarantee coretemp sensor re-binding and restarts NBFC."""
+    if not is_target_hardware():
+        return False
+
     saved_state = check_core1_hardware_state()
     set_core1_state(True)
     subprocess.run(
         ["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+
+    try:
+        os.makedirs("/etc/nbfc", exist_ok=True)
+        if not os.path.exists("/etc/nbfc/nbfc.json"):
+            with open("/etc/nbfc/nbfc.json", "w") as f:
+                f.write('{\n  "SelectedConfigId": "GPD Win 2 (8100y)"\n}\n')
+    except Exception:
+        pass
+
+    for sock in [
+        "/run/nbfc_service.socket",
+        "/run/nbfc_service.pid",
+        "/var/run/nbfc_service.socket",
+        "/var/run/nbfc_service.pid",
+    ]:
+        try:
+            if os.path.exists(sock):
+                os.remove(sock)
+        except Exception:
+            pass
+
     time.sleep(0.3)
     subprocess.run(
         ["systemctl", "restart", "nbfc_service"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    subprocess.run(
+        ["systemctl", "restart", "nbfc"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    nbfc_bin = get_nbfc_bin()
+    running = False
+    for _ in range(6):
+        time.sleep(0.25)
+        try:
+            res = subprocess.run(
+                [nbfc_bin, "status"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if res.returncode == 0:
+                running = True
+                break
+        except Exception:
+            pass
+
+    if not running:
+        try:
+            subprocess.run(
+                [nbfc_bin, "start"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
     if not saved_state:
         time.sleep(0.5)
         set_core1_state(False)
+    return running
 
 
 def set_nbfc_fan(mode):
-    cmd = (
-        ["/usr/bin/nbfc", "set", "-s", "100"]
-        if mode == "100"
-        else ["/usr/bin/nbfc", "set", "-a"]
-    )
+    if not is_target_hardware():
+        return
+    nbfc_bin = get_nbfc_bin()
+    cmd = [nbfc_bin, "set", "-s", "100"] if mode == "100" else [nbfc_bin, "set", "-a"]
     try:
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
@@ -235,8 +312,9 @@ def run_governor():
         try:
             current_time = time.time()
             if current_time - last_nbfc_check > 15:
+                nbfc_bin = get_nbfc_bin()
                 res = subprocess.run(
-                    ["/usr/bin/nbfc", "status"],
+                    [nbfc_bin, "status"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -364,7 +442,20 @@ def run_governor():
 NBFC_PRESTART_PAYLOAD = r"""#!/bin/sh
 # GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y) NBFC Sensor & Socket Initializer
 # Installed and managed by gpd-win-2-governor.py
+
+# Hardware guard: Refuse execution on non-target hardware (multi-boot USB safe)
+if ! grep -q -E "7Y30|m3-7Y30|8100Y|m3-8100Y" /proc/cpuinfo 2>/dev/null; then
+    echo "[gpd-win-2-nbfc-prestart] Non-target hardware detected. Skipping NBFC execution." >&2
+    exit 1
+fi
+
 rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
+
+# Ensure default config exists so daemon does not fail immediately
+if [ ! -f /etc/nbfc/nbfc.json ]; then
+    mkdir -p /etc/nbfc
+    printf '{\n  "SelectedConfigId": "GPD Win 2 (8100y)"\n}\n' > /etc/nbfc/nbfc.json
+fi
 
 # Un-park cores so Intel coretemp DTS sensors are active
 for c in /sys/devices/system/cpu/cpu1/online /sys/devices/system/cpu/cpu3/online; do
@@ -395,6 +486,12 @@ exit 0
 GPD_SLEEP_PAYLOAD = r"""#!/bin/sh
 # GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y) Systemd Suspend/Hibernate CPU Hotplug & EC Synchronization Hook
 # Installed and managed by gpd-win-2-governor.py
+
+# Hardware guard: Pass through immediately on non-target hardware
+if ! grep -q -E "7Y30|m3-7Y30|8100Y|m3-8100Y" /proc/cpuinfo 2>/dev/null; then
+    exit 0
+fi
+
 case "$1" in
     pre)
         # Un-park cores so kernel disable_nonboot_cpus() does not hang or hit DTS races during hibernate
@@ -859,6 +956,7 @@ import sys
 import os
 import time
 import subprocess
+import shutil
 
 STATE_FILE = "/etc/gpd-win-2-lowpower.state"
 SCRIPT_PARENT = "gpd-win-2-governor.py"
@@ -926,19 +1024,77 @@ def set_core1_state(online):
             except IOError:
                 pass
 
+def get_nbfc_bin():
+    return (
+        shutil.which("nbfc")
+        or (os.path.exists("/usr/local/bin/nbfc") and "/usr/local/bin/nbfc")
+        or (os.path.exists("/usr/bin/nbfc") and "/usr/bin/nbfc")
+        or "nbfc"
+    )
+
 def ensure_nbfc_running():
+    nbfc_bin = get_nbfc_bin()
     try:
-        res = subprocess.run(["/usr/bin/nbfc", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if res.returncode != 0:
-            print("NBFC unresponsive. Bringing cores online to re-bind coretemp sensors...")
-            set_core1_state(True)
-            subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(0.3)
-            subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            subprocess.run(["/usr/bin/nbfc", "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        res = subprocess.run([nbfc_bin, "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0:
+            subprocess.run([nbfc_bin, "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
     except Exception:
         pass
+
+    print("NBFC unresponsive. Bringing cores online to re-bind coretemp sensors...")
+    set_core1_state(True)
+    subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    try:
+        os.makedirs("/etc/nbfc", exist_ok=True)
+        if not os.path.exists("/etc/nbfc/nbfc.json"):
+            with open("/etc/nbfc/nbfc.json", "w") as f:
+                f.write('{\n  "SelectedConfigId": "GPD Win 2 (8100y)"\n}\n')
+    except Exception:
+        pass
+
+    for sock in ["/run/nbfc_service.socket", "/run/nbfc_service.pid", "/var/run/nbfc_service.socket", "/var/run/nbfc_service.pid"]:
+        try:
+            if os.path.exists(sock):
+                os.remove(sock)
+        except Exception:
+            pass
+
+    time.sleep(0.3)
+    subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "restart", "nbfc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    running = False
+    for _ in range(6):
+        time.sleep(0.25)
+        try:
+            res = subprocess.run([nbfc_bin, "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                running = True
+                break
+        except Exception:
+            pass
+
+    if not running:
+        try:
+            subprocess.run([nbfc_bin, "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.5)
+            res = subprocess.run([nbfc_bin, "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                running = True
+        except Exception:
+            pass
+
+    if running:
+        try:
+            subprocess.run([nbfc_bin, "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        return True
+    else:
+        print("[ERROR] Failed to start or communicate with NoteBook FanControl (NBFC) daemon.")
+        return False
 
 def show_status():
     print(f"--- {HARDWARE_MODEL} Power Status (Managed by {SCRIPT_PARENT}) ---")
@@ -978,6 +1134,22 @@ def show_status():
             print(f" * Intel GPU Max Frequency:     {f.read().strip()} MHz")
     except Exception:
         pass
+
+    print("--- NoteBook FanControl (NBFC) Status ---")
+    nbfc_ok = ensure_nbfc_running()
+    nbfc_bin = get_nbfc_bin()
+    if nbfc_bin:
+        try:
+            res = subprocess.run([nbfc_bin, "status"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if res.returncode == 0 and res.stdout.strip():
+                print(res.stdout.strip())
+            else:
+                out = res.stdout.strip() if res.stdout else "NBFC service is unresponsive."
+                print(f"[ERROR] Could not query NBFC status (exit code {res.returncode}):\n{out}")
+        except Exception as e:
+            print(f"[ERROR] Failed to run {nbfc_bin} status: {e}")
+    else:
+        print("[ERROR] nbfc binary not found in PATH or standard installation paths.")
 
 if len(sys.argv) < 2 or sys.argv[1].lower() not in ["on", "off", "status"]:
     print(f"Usage: gpd-win-2-lowpower [on|off|status] (Managed by {SCRIPT_PARENT} for {HARDWARE_MODEL})")
@@ -1039,6 +1211,7 @@ Wants=nbfc_service.service
 
 [Service]
 Type=simple
+ExecCondition=/usr/local/bin/gpd-win-2-nbfc-prestart
 ExecStart=/usr/local/bin/gpd-win-2-governor
 Restart=always
 RestartSec=3s
@@ -1176,14 +1349,20 @@ def run_install():
             f"# {MODEL_NAME} coretemp module config (managed by {SCRIPT_NAME})\ncoretemp\n"
         )
 
+    # Pre-seed default NBFC configuration so daemon can start reliably on target hardware
+    os.makedirs("/etc/nbfc", exist_ok=True)
+    if not os.path.exists("/etc/nbfc/nbfc.json"):
+        with open("/etc/nbfc/nbfc.json", "w") as f:
+            f.write('{\n  "SelectedConfigId": "GPD Win 2 (8100y)"\n}\n')
+
     # Install dedicated prestart helper script
     prestart_bin = "/usr/local/bin/gpd-win-2-nbfc-prestart"
     with open(prestart_bin, "w") as f:
         f.write(NBFC_PRESTART_PAYLOAD)
     os.chmod(prestart_bin, 0o755)
 
-    nbfc_bin = shutil.which("nbfc") or "/usr/bin/nbfc"
-    nbfc_service_bin = shutil.which("nbfc_service") or "/usr/bin/nbfc_service"
+    nbfc_bin = get_nbfc_bin()
+    nbfc_service_bin = get_nbfc_service_bin()
     nbfc_service_content = f"""# {MODEL_NAME} NoteBook FanControl service (managed by {SCRIPT_NAME})
 [Unit]
 Description=NoteBook FanControl service (nbfc-linux for {MODEL_NAME}, managed by {SCRIPT_NAME})
@@ -1192,6 +1371,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+ExecCondition={prestart_bin}
 ExecStartPre={prestart_bin}
 ExecStart={nbfc_service_bin}
 ExecStopPost=/bin/rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
@@ -1214,9 +1394,16 @@ WantedBy=multi-user.target
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
 
+    # For portable USB keys, enable service for boot on Win 2; start live only if currently on Win 2
+    subprocess.run(
+        ["systemctl", "enable", "nbfc_service.service"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
     if is_target_hardware():
         subprocess.run(
-            ["systemctl", "enable", "--now", "nbfc_service.service"],
+            ["systemctl", "start", "nbfc_service.service"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1332,10 +1519,13 @@ WantedBy=multi-user.target
         f.write(GPD_GOVERNOR_SERVICE)
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(
+        ["systemctl", "enable", "gpd-win-2-governor.service"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     if is_target_hardware():
-        subprocess.run(
-            ["systemctl", "enable", "--now", "gpd-win-2-governor.service"], check=True
-        )
+        subprocess.run(["systemctl", "start", "gpd-win-2-governor.service"], check=True)
 
     print(f"\n[SUCCESS] {MODEL_NAME} Stack Installed!")
     print(f"          (Managed by {SCRIPT_NAME})")
