@@ -2,7 +2,20 @@
 """
 GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y) Universal Governor & All-in-One Installer
 -----------------------------------------------------------------------------------
-Namespaced strictly for GPD Win 2 portable/multi-boot installations.
+Script: gpd-win-2-governor.py
+Hardware: GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y Kaby Lake-Y / Amber Lake-Y)
+
+Deploys:
+  1. Early initramfs power watchdog (/usr/local/bin/gpd-win-2-power-watchdog)
+     - Safe fsck-aware ACPI poweroff on power button press
+     - GNOME-matching 20-step dynamic backlight scaling & auto-dim
+     - Prompt-gated inactivity timer (dims/suspends only during active prompts)
+     - Early-boot quiet thermal profile (1-core 30% max, 300MHz GPU)
+  2. Dynamic staged thermal governor (/usr/local/bin/gpd-win-2-governor)
+     - Multi-stage temperature control with NBFC fan supervision
+     - Persistent low-power mode across reboots (/etc/gpd-win-2-lowpower.state)
+  3. Hardware-tuned lowpower utility (/usr/local/bin/gpd-win-2-lowpower)
+  4. System-sleep hibernate/suspend CPU hotplug & EC synchronization fix
 
 Usage:
   gpd-win-2-governor.py --install   # Full system deploy (auto-elevates with sudo)
@@ -11,10 +24,14 @@ Usage:
 
 import os
 import sys
+import re
 import time
 import subprocess
 import shutil
-import re
+
+SCRIPT_NAME = "gpd-win-2-governor.py"
+MODEL_NAME = "GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y)"
+STATE_FILE = "/etc/gpd-win-2-lowpower.state"
 
 # =====================================================================
 # PRIVILEGE ELEVATION & HARDWARE VALIDATION
@@ -26,7 +43,7 @@ def ensure_root():
             args = ["sudo", sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
             os.execvp("sudo", args)
         except Exception as e:
-            print(f"[ERROR] Failed to auto-elevate with sudo: {e}")
+            print(f"[ERROR] [{SCRIPT_NAME}] Failed to auto-elevate with sudo: {e}")
             sys.exit(1)
 
 def is_target_hardware():
@@ -39,6 +56,16 @@ def is_target_hardware():
             cpuinfo = f.read()
         if any(sig in cpuinfo for sig in ["7Y30", "m3-7Y30", "8100Y", "m3-8100Y"]):
             return True
+    except Exception:
+        pass
+    return False
+
+def is_lowpower_state_enabled():
+    """Checks if low-power mode has been persistently configured."""
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                return f.read().strip().lower() == "on"
     except Exception:
         pass
     return False
@@ -106,6 +133,25 @@ def set_turbo_state(enabled):
         except IOError:
             pass
 
+def set_scaling_governor(governor_string):
+    try:
+        for cpu in range(os.cpu_count() or 4):
+            path = f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_governor"
+            if os.path.exists(path):
+                with open(path, "w") as f:
+                    f.write(governor_string)
+    except Exception:
+        pass
+
+def set_gpu_max_freq(mhz):
+    try:
+        path = "/sys/class/drm/card0/gt_max_freq_mhz"
+        if os.path.exists(path):
+            with open(path, "w") as f:
+                f.write(str(mhz))
+    except Exception:
+        pass
+
 def get_battery_metrics():
     capacity = 100
     is_charging = False
@@ -124,39 +170,6 @@ def restart_nbfc():
     """Brings cores online temporarily to guarantee coretemp sensor re-binding."""
     saved_state = check_core1_hardware_state()
     set_core1_state(True)
-    os.makedirs("/etc/nbfc", exist_ok=True)
-    # Ensure config symlink exists so both "GPD Win 2" and "GPD Win 2 (8100y)" resolve
-    for cdir in ["/usr/share/nbfc/configs", "/etc/nbfc/configs"]:
-        if os.path.isdir(cdir):
-            f_81 = os.path.join(cdir, "GPD Win 2 (8100y).json")
-            f_pl = os.path.join(cdir, "GPD Win 2.json")
-            if os.path.isfile(f_81) and not os.path.exists(f_pl):
-                try:
-                    os.symlink("GPD Win 2 (8100y).json", f_pl)
-                except Exception:
-                    pass
-            elif os.path.isfile(f_pl) and not os.path.exists(f_81):
-                try:
-                    os.symlink("GPD Win 2.json", f_81)
-                except Exception:
-                    pass
-    cfg = "GPD Win 2 (8100y)"
-    cfg_payload = '{\n  "SelectedConfigId": "' + cfg + '"\n}\n'
-    for cfile in ["/etc/nbfc/nbfc_service.json", "/etc/nbfc/nbfc.json"]:
-        try:
-            with open(cfile, "w") as f:
-                f.write(cfg_payload)
-        except Exception:
-            pass
-    # Ensure ec_sys write support is enabled
-    if os.path.exists("/sys/module/ec_sys/parameters/write_support"):
-        try:
-            with open("/sys/module/ec_sys/parameters/write_support", "w") as f_ws:
-                f_ws.write("1\n")
-        except Exception:
-            pass
-    else:
-        subprocess.run(["modprobe", "ec_sys", "write_support=1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.3)
     subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -179,10 +192,10 @@ def run_governor():
     ensure_root()
 
     if not is_target_hardware():
-        print("[gpd-win-2-governor] Non-GPD Win 2 hardware detected. Halting safely with 0% overhead (status 77).")
-        sys.exit(77)
+        print(f"[{SCRIPT_NAME}] Non-target hardware detected. Halting safely with 0% overhead.")
+        sys.exit(0)
 
-    print("GPD Win 2 Dynamic Thermal Governor Online.")
+    print(f"{MODEL_NAME} Dynamic Thermal Governor Online.")
     CPU_TEMP_PATH = get_cpu_thermal_zone_path()
 
     core1_is_online = check_core1_hardware_state()
@@ -200,12 +213,25 @@ def run_governor():
                     restart_nbfc()
                 last_nbfc_check = current_time
 
+            # Persistent low-power mode handling
+            if is_lowpower_state_enabled():
+                if core1_is_online:
+                    set_core1_state(False)
+                    core1_is_online = False
+                set_turbo_state(False)
+                set_scaling_governor("powersave")
+                apply_pstate_limit(30)
+                set_gpu_max_freq(300)
+                time.sleep(2)
+                continue
+
             with open(CPU_TEMP_PATH, "r") as f:
                 temp = float(f.read().strip()) / 1000.0
-                
+
             capacity, is_charging = get_battery_metrics()
             load1, _, _ = os.getloadavg()
-            normalized_load = load1 / os.cpu_count()
+            cpu_cnt = os.cpu_count() or 4
+            normalized_load = load1 / cpu_cnt
 
             is_critically_low = (not is_charging and capacity <= 10) or (is_charging and capacity <= 5)
 
@@ -228,7 +254,7 @@ def run_governor():
                 print(f"[{time.strftime('%H:%M:%S')}] STAGE 2 BREAK: Temp {temp}C. Disabling Core 1 + Fan Boost.")
                 time.sleep(0.5)
                 continue
-            
+
             if forced_emergency_core_drop and temp <= CORE_RESTORE_TEMP and (current_time - last_core_drop_time > 15):
                 set_core1_state(True)
                 core1_is_online = True
@@ -249,7 +275,7 @@ def run_governor():
                     if not core1_is_online:
                         set_core1_state(True)
                         core1_is_online = True
-                    
+
                     if temp >= TURBO_DROP_TEMP and turbo_is_enabled:
                         set_turbo_state(False)
                         turbo_is_enabled = False
@@ -274,7 +300,7 @@ def run_governor():
                         target_pct = current_max_pct
 
                     apply_pstate_limit(target_pct)
-                
+
         except Exception:
             pass
         time.sleep(0.5)
@@ -284,17 +310,8 @@ def run_governor():
 # =====================================================================
 
 NBFC_PRESTART_PAYLOAD = r"""#!/bin/sh
-# GPD Win 2 NBFC Pre-flight Sensor & Socket Initializer
-# MULTI-MACHINE USB SAFETY GUARD:
-# Strictly abort if booted on non-Win 2 hardware (such as GPD Pocket 3 or other PCs)
-# to prevent writing mismatched fan register offsets to a foreign Embedded Controller.
-# Exit code 77 tells systemd (EX_UNAVAILABLE) that the condition was not met,
-# deactivating the unit without marking it as failed or triggering restart loops.
-if ! grep -E -i -q '7y30|8100y' /proc/cpuinfo 2>/dev/null; then
-    echo "[gpd-win-2-nbfc-prestart] Foreign hardware detected. Bailing out with code 77 to protect EC." >&2
-    exit 77
-fi
-
+# GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y) NBFC Sensor & Socket Initializer
+# Installed and managed by gpd-win-2-governor.py
 rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
 
 # Un-park cores so Intel coretemp DTS sensors are active
@@ -303,13 +320,6 @@ for c in /sys/devices/system/cpu/cpu1/online /sys/devices/system/cpu/cpu3/online
         echo 1 > "$c" 2>/dev/null || true
     fi
 done
-
-# Enable ec_sys write support for direct EC register manipulation
-if [ -f /sys/module/ec_sys/parameters/write_support ]; then
-    echo 1 > /sys/module/ec_sys/parameters/write_support 2>/dev/null || true
-else
-    modprobe ec_sys write_support=1 2>/dev/null || true
-fi
 
 modprobe coretemp 2>/dev/null || true
 
@@ -330,7 +340,37 @@ done
 exit 0
 """
 
-C_WATCHDOG_PAYLOAD = r"""#include <stdio.h>
+GPD_SLEEP_PAYLOAD = r"""#!/bin/sh
+# GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y) Systemd Suspend/Hibernate CPU Hotplug & EC Synchronization Hook
+# Installed and managed by gpd-win-2-governor.py
+case "$1" in
+    pre)
+        # Un-park cores so kernel disable_nonboot_cpus() does not hang or hit DTS races during hibernate
+        for c in /sys/devices/system/cpu/cpu1/online /sys/devices/system/cpu/cpu3/online; do
+            if [ -f "$c" ]; then
+                echo 1 > "$c" 2>/dev/null || true
+            fi
+        done
+        modprobe coretemp 2>/dev/null || true
+        # Ensure full pstate ceiling before freezing
+        if [ -f /sys/devices/system/cpu/intel_pstate/max_perf_pct ]; then
+            echo 100 > /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null || true
+        fi
+        ;;
+    post)
+        # Restore governor supervision post-resume
+        systemctl restart gpd-win-2-governor.service 2>/dev/null || true
+        ;;
+esac
+exit 0
+"""
+
+C_WATCHDOG_PAYLOAD = r"""/*
+ * GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y) Early Power Watchdog
+ * Installed and managed by gpd-win-2-governor.py
+ */
+
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -341,12 +381,12 @@ C_WATCHDOG_PAYLOAD = r"""#include <stdio.h>
 #include <time.h>
 #include <glob.h>
 #include <errno.h>
+#include <dirent.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/reboot.h>
 #include <sys/ioctl.h>
 #include <linux/input.h>
-#include <dirent.h>
 
 #define BACKLIGHT_PATH "/sys/class/backlight/intel_backlight"
 #define POWER_STATE_PATH "/sys/power/state"
@@ -482,6 +522,121 @@ void restore_full_cores(void) {
     write_sysfs("/sys/devices/system/cpu/cpu3/online", "1\n");
 }
 
+static int is_fsck_running(void) {
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *ent;
+    int running = 0;
+    pid_t my_pid = getpid();
+
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] >= '0' && ent->d_name[0] <= '9') {
+            pid_t p = (pid_t)atoi(ent->d_name);
+            if (p == my_pid) continue;
+
+            char comm_path[512];
+            snprintf(comm_path, sizeof(comm_path), "/proc/%s/comm", ent->d_name);
+            FILE *f = fopen(comm_path, "r");
+            if (f) {
+                char comm[128];
+                if (fgets(comm, sizeof(comm), f)) {
+                    comm[strcspn(comm, "\r\n")] = 0;
+                    if (strcmp(comm, "fsck") == 0 ||
+                        strncmp(comm, "fsck.", 5) == 0 ||
+                        strcmp(comm, "e2fsck") == 0 ||
+                        strcmp(comm, "dosfsck") == 0 ||
+                        strcmp(comm, "btrfsck") == 0 ||
+                        strcmp(comm, "xfs_repair") == 0) {
+                        running = 1;
+                        fclose(f);
+                        break;
+                    }
+                }
+                fclose(f);
+            }
+        }
+    }
+    closedir(d);
+    return running;
+}
+
+static int is_user_prompt_active(void) {
+    if (is_fsck_running()) return 0;
+
+    DIR *sd = opendir("/run/systemd/ask-password");
+    if (sd) {
+        struct dirent *ent;
+        while ((ent = readdir(sd)) != NULL) {
+            if (strncmp(ent->d_name, "ask.", 4) == 0) {
+                closedir(sd);
+                return 1;
+            }
+        }
+        closedir(sd);
+    }
+
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *ent;
+    int prompt_found = 0;
+    pid_t my_pid = getpid();
+
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] >= '0' && ent->d_name[0] <= '9') {
+            pid_t p = (pid_t)atoi(ent->d_name);
+            if (p == my_pid) continue;
+
+            char comm_path[512];
+            snprintf(comm_path, sizeof(comm_path), "/proc/%s/comm", ent->d_name);
+            FILE *f = fopen(comm_path, "r");
+            if (f) {
+                char comm[128];
+                if (fgets(comm, sizeof(comm), f)) {
+                    comm[strcspn(comm, "\r\n")] = 0;
+                    if (strcmp(comm, "askpass") == 0 ||
+                        strcmp(comm, "cryptsetup") == 0 ||
+                        strcmp(comm, "passprompt") == 0 ||
+                        strncmp(comm, "systemd-ask-", 12) == 0 ||
+                        strncmp(comm, "systemd-tty-ask", 15) == 0 ||
+                        strcmp(comm, "sulogin") == 0 ||
+                        strcmp(comm, "login") == 0 ||
+                        strcmp(comm, "agetty") == 0 ||
+                        strcmp(comm, "getty") == 0 ||
+                        strcmp(comm, "whiptail") == 0 ||
+                        strcmp(comm, "dialog") == 0) {
+                        prompt_found = 1;
+                        fclose(f);
+                        break;
+                    }
+                    if (strcmp(comm, "plymouth") == 0) {
+                        char cmd_path[512];
+                        snprintf(cmd_path, sizeof(cmd_path), "/proc/%s/cmdline", ent->d_name);
+                        FILE *cf = fopen(cmd_path, "r");
+                        if (cf) {
+                            char cmd[256];
+                            size_t n = fread(cmd, 1, sizeof(cmd) - 1, cf);
+                            cmd[n] = 0;
+                            for (size_t i = 0; i < n; i++) {
+                                if (strstr(cmd + i, "ask-for-password") ||
+                                    strstr(cmd + i, "watch-keystroke") ||
+                                    strstr(cmd + i, "ask-question")) {
+                                    prompt_found = 1;
+                                    break;
+                                }
+                            }
+                            fclose(cf);
+                            if (prompt_found) { fclose(f); break; }
+                        }
+                    }
+                }
+                fclose(f);
+            }
+        }
+    }
+    closedir(d);
+    return prompt_found;
+}
+
 int scan_inputs(struct pollfd *fds, int max_fds) {
     for (int i = 0; i < max_fds; i++) {
         if (fds[i].fd >= 0) {
@@ -508,59 +663,11 @@ int scan_inputs(struct pollfd *fds, int max_fds) {
     return num_fds;
 }
 
-
-static int is_fsck_running(void) {
-    DIR *d = opendir("/proc");
-    if (!d) return 0;
-    struct dirent *ent;
-    int running = 0;
-    pid_t my_pid = getpid();
-
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] >= '0' && ent->d_name[0] <= '9') {
-            pid_t p = (pid_t)atoi(ent->d_name);
-            if (p == my_pid) continue;
-
-            char stat_path[512];
-            snprintf(stat_path, sizeof(stat_path), "/proc/%s/stat", ent->d_name);
-            FILE *f = fopen(stat_path, "r");
-            if (f) {
-                char buf[512];
-                if (fgets(buf, sizeof(buf), f)) {
-                    char *open_p = strchr(buf, '(');
-                    char *close_p = strrchr(buf, ')');
-                    if (open_p && close_p && close_p > open_p) {
-                        *close_p = '\0';
-                        char *comm = open_p + 1;
-                        char state = *(close_p + 2); // character right after ") "
-
-                        if (state != 'Z' && state != 'X') {
-                            if (strcmp(comm, "fsck") == 0 ||
-                                strncmp(comm, "fsck.", 5) == 0 ||
-                                strcmp(comm, "e2fsck") == 0 ||
-                                strcmp(comm, "dosfsck") == 0 ||
-                                strcmp(comm, "btrfsck") == 0 ||
-                                strcmp(comm, "xfs_repair") == 0) {
-                                running = 1;
-                                fclose(f);
-                                break;
-                            }
-                        }
-                    }
-                }
-                fclose(f);
-            }
-        }
-    }
-    closedir(d);
-    return running;
-}
-
 void power_off_immediate(void) {
     if (is_fsck_running()) {
         log_msg("Power button pressed while fsck is active! Deferring shutdown until fsck finishes...");
         int wait_count = 0;
-        while (is_fsck_running() && wait_count < 600) { // wait up to 60s
+        while (is_fsck_running() && wait_count < 600) {
             usleep(100000);
             wait_count++;
         }
@@ -571,7 +678,7 @@ void power_off_immediate(void) {
         }
     }
 
-    log_msg("CRITICAL: Power button confirmed! Blanking screen and issuing ACPI Poweroff...");
+    log_msg("CRITICAL: Power button pressed! Blanking screen and issuing ACPI Poweroff...");
     set_brightness(0);
     sync();
     reboot(RB_POWER_OFF);
@@ -588,7 +695,7 @@ int main(void) {
         return 0;
     }
 
-    log_msg("=== GPD Win 2 Watchdog Active ===");
+    log_msg("=== GPD Win 2 Watchdog Active (managed by gpd-win-2-governor.py) ===");
 
     signal(SIGTERM, handle_signal);
     signal(SIGINT, handle_signal);
@@ -652,20 +759,30 @@ int main(void) {
                 }
             }
         } else if (ret == 0) {
-            idle_seconds++;
+            int prompt_active = is_user_prompt_active();
+            if (prompt_active) {
+                idle_seconds++;
 
-            if (idle_seconds >= 60) {
-                log_msg("60s idle reached. Suspending to RAM (S3)...");
-                state = STATE_SUSPEND;
-                write_sysfs(POWER_STATE_PATH, "mem\n");
-                log_msg("Resumed from S3 suspend. Restoring user brightness (%d).", user_brightness);
-                set_brightness(user_brightness);
+                if (idle_seconds >= 60) {
+                    log_msg("60s idle reached during user prompt. Suspending to RAM (S3)...");
+                    state = STATE_SUSPEND;
+                    write_sysfs(POWER_STATE_PATH, "mem\n");
+                    log_msg("Resumed from S3 suspend. Restoring user brightness (%d).", user_brightness);
+                    set_brightness(user_brightness);
+                    idle_seconds = 0;
+                    state = STATE_NORMAL;
+                } else if (idle_seconds >= 30 && state == STATE_NORMAL) {
+                    log_msg("30s idle reached during user prompt. Dimming display to minimum (%d)...", min_brightness);
+                    set_brightness(min_brightness);
+                    state = STATE_DIM;
+                }
+            } else {
                 idle_seconds = 0;
-                state = STATE_NORMAL;
-            } else if (idle_seconds >= 30 && state == STATE_NORMAL) {
-                log_msg("30s idle reached. Dimming display to minimum (%d)...", min_brightness);
-                set_brightness(min_brightness);
-                state = STATE_DIM;
+                if (state != STATE_NORMAL) {
+                    log_msg("Prompt concluded or inactive: Restoring normal brightness (%d).", user_brightness);
+                    set_brightness(user_brightness);
+                    state = STATE_NORMAL;
+                }
             }
         }
     }
@@ -683,12 +800,17 @@ int main(void) {
 """
 
 LOWPOWER_PAYLOAD = r"""#!/usr/bin/env python3
+# GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y) Low-Power Control Utility
+# Installed and managed by gpd-win-2-governor.py
+
 import sys
 import os
 import time
-import glob
 import subprocess
-import shutil
+
+STATE_FILE = "/etc/gpd-win-2-lowpower.state"
+SCRIPT_PARENT = "gpd-win-2-governor.py"
+HARDWARE_MODEL = "GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y)"
 
 def ensure_root():
     if os.geteuid() != 0:
@@ -696,7 +818,7 @@ def ensure_root():
             args = ["sudo", sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
             os.execvp("sudo", args)
         except Exception as e:
-            print(f"[ERROR] Failed to auto-elevate with sudo: {e}")
+            print(f"[ERROR] [gpd-win-2-lowpower] Failed to auto-elevate with sudo: {e}")
             sys.exit(1)
 
 def is_target_hardware():
@@ -710,7 +832,7 @@ def is_target_hardware():
 ensure_root()
 
 if not is_target_hardware():
-    print("[ERROR] This command is strictly hardware-locked to GPD Win 2 (m3-7Y30 / m3-8100Y).")
+    print(f"[ERROR] Strictly hardware-locked to {HARDWARE_MODEL}.")
     print("        Refusing execution on non-target hardware.")
     sys.exit(1)
 
@@ -719,13 +841,13 @@ def apply_pstate_limit(percentage):
         path = "/sys/devices/system/cpu/intel_pstate/max_perf_pct"
         if os.path.exists(path):
             with open(path, "w") as f:
-                f.write(str(percentage))
+                f.write(str(int(percentage)))
     except Exception:
         pass
 
 def set_scaling_governor(governor_string):
     try:
-        for cpu in range(os.cpu_count()):
+        for cpu in range(os.cpu_count() or 4):
             path = f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_governor"
             if os.path.exists(path):
                 with open(path, "w") as f:
@@ -753,131 +875,60 @@ def set_core1_state(online):
                 pass
 
 def ensure_nbfc_running():
-    nbfc_cli = shutil.which("nbfc") or "/usr/local/bin/nbfc" or "/usr/bin/nbfc"
     try:
-        res = subprocess.run([nbfc_cli, "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        res = subprocess.run(["/usr/bin/nbfc", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
             print("NBFC unresponsive. Bringing cores online to re-bind coretemp sensors...")
             set_core1_state(True)
-            # Ensure config symlinks exist in configs directory
-            for cdir in ["/usr/share/nbfc/configs", "/etc/nbfc/configs"]:
-                if os.path.isdir(cdir):
-                    f_81 = os.path.join(cdir, "GPD Win 2 (8100y).json")
-                    f_pl = os.path.join(cdir, "GPD Win 2.json")
-                    if os.path.isfile(f_81) and not os.path.exists(f_pl):
-                        try:
-                            os.symlink("GPD Win 2 (8100y).json", f_pl)
-                        except Exception:
-                            pass
-                    elif os.path.isfile(f_pl) and not os.path.exists(f_81):
-                        try:
-                            os.symlink("GPD Win 2.json", f_81)
-                        except Exception:
-                            pass
-            os.makedirs("/etc/nbfc", exist_ok=True)
-            cfg = "GPD Win 2 (8100y)"
-            cfg_json = f'{{\n  "SelectedConfigId": "{cfg}"\n}}\n'
-            for cfile in ["/etc/nbfc/nbfc_service.json", "/etc/nbfc/nbfc.json"]:
-                with open(cfile, "w") as f:
-                    f.write(cfg_json)
             subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.3)
             subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(1.0)
-            subprocess.run([nbfc_cli, "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            subprocess.run([nbfc_cli, "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["/usr/bin/nbfc", "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
 def show_status():
-    print("--- GPD Win 2 (m3-7Y30 / m3-8100Y) Power Status ---")
-    temp_str = "Unknown"
-    for z in glob.glob("/sys/class/thermal/thermal_zone*/type"):
-        try:
-            with open(z) as f_zt:
-                if "x86_pkg_temp" in f_zt.read():
-                    tpath = os.path.join(os.path.dirname(z), "temp")
-                    with open(tpath) as f_tp:
-                        temp_str = f"{float(f_tp.read().strip()) / 1000.0:.1f}°C"
-                    break
-        except Exception:
-            pass
-    print(f" * CPU Package Temp:  {temp_str}")
+    print(f"--- {HARDWARE_MODEL} Power Status (Managed by {SCRIPT_PARENT}) ---")
+    persisted = "off"
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                persisted = f.read().strip().lower()
+    except Exception:
+        pass
+    print(f" * Persistent Low-Power State: {'Enabled (ON)' if persisted == 'on' else 'Disabled (OFF)'}")
 
-    c1_online = True
-    if os.path.exists("/sys/devices/system/cpu/cpu1/online"):
-        try:
-            with open("/sys/devices/system/cpu/cpu1/online") as f_c1:
-                c1_online = (f_c1.read().strip() == "1")
-        except Exception:
-            pass
-    print(f" * Core Topology:     {'Dual-Core (4 threads)' if c1_online else 'Single-Core (Core 1 Parked)'}")
+    c1 = "Offline"
+    try:
+        with open("/sys/devices/system/cpu/cpu1/online") as f:
+            c1 = "Online" if f.read().strip() == "1" else "Offline"
+    except Exception:
+        c1 = "Online"
+    print(f" * Secondary CPU Cores:        {c1}")
 
     no_turbo = "0"
-    if os.path.exists("/sys/devices/system/cpu/intel_pstate/no_turbo"):
-        try:
-            with open("/sys/devices/system/cpu/intel_pstate/no_turbo") as f_nt:
-                no_turbo = f_nt.read().strip()
-        except Exception:
-            pass
-    print(f" * Intel Turbo Boost: {'Disabled' if no_turbo == '1' else 'Enabled'}")
+    try:
+        with open("/sys/devices/system/cpu/intel_pstate/no_turbo") as f:
+            no_turbo = f.read().strip()
+    except Exception:
+        pass
+    print(f" * Intel Turbo Boost:           {'Disabled' if no_turbo == '1' else 'Enabled'}")
 
-    if os.path.exists("/sys/devices/system/cpu/intel_pstate/max_perf_pct"):
-        try:
-            with open("/sys/devices/system/cpu/intel_pstate/max_perf_pct") as f_mp:
-                print(f" * Max Perf Ceiling:  {f_mp.read().strip()}%")
-        except Exception:
-            pass
+    try:
+        with open("/sys/devices/system/cpu/intel_pstate/max_perf_pct") as f:
+            print(f" * Max Performance Pct:         {f.read().strip()}%")
+    except Exception:
+        pass
 
-    if os.path.exists("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"):
-        try:
-            with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") as f_sg:
-                print(f" * Scaling Governor:  {f_sg.read().strip()}")
-        except Exception:
-            pass
-
-    if os.path.exists("/sys/class/drm/card0/gt_max_freq_mhz"):
-        try:
-            with open("/sys/class/drm/card0/gt_max_freq_mhz") as f_gf:
-                print(f" * GPU Max Frequency: {f_gf.read().strip()} MHz")
-        except Exception:
-            pass
-
-    cap = "Unknown"
-    charging = "Unknown"
-    if os.path.exists("/sys/class/power_supply/BAT0/capacity"):
-        try:
-            with open("/sys/class/power_supply/BAT0/capacity") as f_cap:
-                cap = f"{f_cap.read().strip()}%"
-        except Exception:
-            pass
-    if os.path.exists("/sys/class/power_supply/BAT0/status"):
-        try:
-            charging = open("/sys/class/power_supply/BAT0/status").read().strip()
-        except Exception:
-            pass
-    elif os.path.exists("/sys/class/power_supply/AC/online"):
-        try:
-            charging = "Charging" if open("/sys/class/power_supply/AC/online").read().strip() == "1" else "On Battery"
-        except Exception:
-            pass
-    print(f" * Battery & Power:   {cap} ({charging})")
-
-    gov_active = subprocess.run(["systemctl", "is-active", "--quiet", "gpd-win-2-governor.service"]).returncode == 0
-    print(f" * Governor Service:  {'Active (Running)' if gov_active else 'Inactive / Overridden'}")
-
-    nbfc_cli = shutil.which("nbfc") or "/usr/local/bin/nbfc" or "/usr/bin/nbfc"
-    res = subprocess.run([nbfc_cli, "status"], capture_output=True, text=True)
-    if res.returncode == 0:
-        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
-        for l in lines:
-            print(f" * NBFC: {l}")
-    else:
-        print(" * NBFC Service:      Not responding on UNIX socket")
+    try:
+        with open("/sys/class/drm/card0/gt_max_freq_mhz") as f:
+            print(f" * Intel GPU Max Frequency:     {f.read().strip()} MHz")
+    except Exception:
+        pass
 
 if len(sys.argv) < 2 or sys.argv[1].lower() not in ["on", "off", "status"]:
-    print("Usage: gpd-win-2-lowpower [on|off|status]")
+    print(f"Usage: gpd-win-2-lowpower [on|off|status] (Managed by {SCRIPT_PARENT} for {HARDWARE_MODEL})")
     sys.exit(1)
 
 action = sys.argv[1].lower()
@@ -886,9 +937,14 @@ if action == "status":
     show_status()
 
 elif action == "on":
-    print("Entering Ultimate Low Power Mode (GPD Win 2)...")
-    subprocess.run(["systemctl", "stop", "gpd-win-2-governor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["pkill", "-f", "gpd-win-2-governor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"Entering Ultimate Low Power Mode ({HARDWARE_MODEL}, managed by {SCRIPT_PARENT})...")
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            f.write("on\n")
+    except Exception as e:
+        print(f"[WARNING] Could not write persistent state to {STATE_FILE}: {e}")
+
     ensure_nbfc_running()
     set_turbo_state(False)
     set_scaling_governor("powersave")
@@ -897,10 +953,19 @@ elif action == "on":
     if os.path.exists("/sys/class/drm/card0/gt_max_freq_mhz"):
         with open("/sys/class/drm/card0/gt_max_freq_mhz", "w") as f:
             f.write("300")
+    subprocess.run(["systemctl", "restart", "gpd-win-2-governor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("System clamped to single physical core (30% max perf, 300MHz GPU). Thermals minimized.")
+    print("State saved: Low-power mode will persist across reboots.")
 
 elif action == "off":
-    print("Restoring Adaptive Performance Mode (GPD Win 2)...")
+    print(f"Restoring Adaptive Performance Mode ({HARDWARE_MODEL}, managed by {SCRIPT_PARENT})...")
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            f.write("off\n")
+    except Exception as e:
+        print(f"[WARNING] Could not write persistent state to {STATE_FILE}: {e}")
+
     set_core1_state(True)
     ensure_nbfc_running()
     if os.path.exists("/sys/class/drm/card0/gt_max_freq_mhz"):
@@ -908,18 +973,20 @@ elif action == "off":
             f.write("850")
     set_turbo_state(True)
     apply_pstate_limit(100)
-    subprocess.run(["systemctl", "start", "gpd-win-2-governor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "restart", "gpd-win-2-governor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("Adaptive governor restored via systemd.")
+    print("State saved: Adaptive performance mode will persist across reboots.")
 """
 
-GPD_GOVERNOR_SERVICE = """[Unit]
-Description=GPD Win 2 Dynamic Thermal Governor & Watchdog
+GPD_GOVERNOR_SERVICE = """# GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y) Dynamic Thermal Governor Unit
+# Installed and managed by gpd-win-2-governor.py
+[Unit]
+Description=GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y) Dynamic Thermal Governor & Watchdog (managed by gpd-win-2-governor.py)
 After=multi-user.target nbfc_service.service
 Wants=nbfc_service.service
 
 [Service]
 Type=simple
-RestartPreventExitStatus=77
 ExecStart=/usr/local/bin/gpd-win-2-governor
 Restart=always
 RestartSec=3s
@@ -929,6 +996,65 @@ WantedBy=multi-user.target
 """
 
 # =====================================================================
+# CONFIGURATION GUARD BLOCK HELPER (Debian-Safe)
+# =====================================================================
+def update_guarded_config(file_path, block_tag, lines_to_set):
+    """Updates a guarded block in a shared config file without clobbering other lines."""
+    begin_mark = f"### BEGIN {block_tag} (managed by {SCRIPT_NAME}) ###"
+    end_mark = f"### END {block_tag} (managed by {SCRIPT_NAME}) ###"
+    block_content = f"{begin_mark}\n" + "\n".join(lines_to_set) + f"\n{end_mark}\n"
+
+    existing = ""
+    if os.path.exists(file_path):
+        with open(file_path, "r") as f:
+            existing = f.read()
+
+    pattern = re.compile(
+        rf"### BEGIN {re.escape(block_tag)}.*?###\n.*?### END {re.escape(block_tag)}.*?###\n?",
+        re.DOTALL
+    )
+    if pattern.search(existing):
+        updated = pattern.sub(block_content, existing)
+    else:
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        updated = existing + block_content
+
+    os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+    with open(file_path, "w") as f:
+        f.write(updated)
+
+def cleanup_obsolete_remnants():
+    """Removes obsolete files, deprecated hook names, and stale artifacts from older versions."""
+    obsolete_paths = [
+        # Deprecated initramfs hook names
+        "/etc/initramfs-tools/hooks/gpd-win-2-power",
+        "/etc/initramfs-tools/hooks/gpd-win-2-governor",
+        "/etc/initramfs-tools/hooks/early_power_watchdog",
+        "/etc/initramfs-tools/scripts/init-top/gpd-win-2-power",
+        "/etc/initramfs-tools/scripts/init-top/gpd-win-2-governor",
+        "/etc/initramfs-tools/scripts/init-top/early_power_watchdog",
+        "/etc/initramfs-tools/scripts/init-bottom/gpd-win-2-power",
+        "/etc/initramfs-tools/scripts/init-bottom/gpd-win-2-governor",
+        "/etc/initramfs-tools/scripts/init-bottom/early_power_watchdog",
+        # Deprecated binary / source locations
+        "/usr/local/bin/early_power_watchdog",
+        "/usr/local/bin/gpd_win_2_power_watchdog",
+        "/usr/local/src/early_power_watchdog.c",
+        "/usr/local/src/gpd_win_2_power_watchdog.c",
+        # Stale runtime pidfiles
+        "/run/early_power_watchdog.pid",
+        "/run/gpd_win_2_watchdog.pid",
+    ]
+    for path in obsolete_paths:
+        try:
+            if os.path.islink(path) or os.path.isfile(path):
+                os.remove(path)
+                print(f"  Removed obsolete artifact: {path}")
+        except Exception:
+            pass
+
+# =====================================================================
 # PART 3: AUTOMATED INSTALLER ENGINE (--install)
 # =====================================================================
 
@@ -936,179 +1062,50 @@ def run_install():
     ensure_root()
 
     print("\n====================================================================")
-    print(" GPD Win 2 (m3-7Y30 / m3-8100Y) Universal Stack Installer           ")
+    print(f" {MODEL_NAME} Universal Stack Installer")
+    print(f" Installer Script: {SCRIPT_NAME}")
     print("====================================================================\n")
 
     if not is_target_hardware():
-        print("[WARNING] Host hardware is NOT a GPD Win 2.")
+        print(f"[WARNING] Host hardware is NOT a {MODEL_NAME}.")
         print("          Proceeding with installation for portable USB drive deployment.")
         print("          (Hardware guards will ensure these scripts remain dormant on other PCs).\n")
 
     # Step 1: Install build prerequisites only if missing
-    print("[1/8] Verifying build dependencies...")
-    has_binaries = all(shutil.which(p) is not None for p in ["gcc", "make", "git", "pkg-config"])
-    has_ev = os.path.exists("/usr/include/ev.h") or (shutil.which("pkg-config") and subprocess.run(["pkg-config", "--exists", "libev"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
-    has_curl = os.path.exists("/usr/include/curl/curl.h") or (shutil.which("pkg-config") and subprocess.run(["pkg-config", "--exists", "libcurl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
-    has_ssl = os.path.exists("/usr/include/openssl/crypto.h") or os.path.exists("/usr/include/openssl/ssl.h") or (shutil.which("pkg-config") and subprocess.run(["pkg-config", "--exists", "openssl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
-    has_xml = os.path.exists("/usr/include/libxml2/libxml/parser.h") or os.path.exists("/usr/include/libxml/parser.h") or (shutil.which("pkg-config") and subprocess.run(["pkg-config", "--exists", "libxml-2.0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
-    has_lua = any(os.path.exists(f"{p}/lua.h") for p in ["/usr/include", "/usr/include/lua5.4", "/usr/include/lua5.3", "/usr/include/lua5.2", "/usr/include/luajit-2.1"]) or (shutil.which("pkg-config") and any(subprocess.run(["pkg-config", "--exists", l], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 for l in ["lua5.4", "lua-5.4", "lua54", "lua5.3", "lua", "luajit"]))
-
-    if not (has_binaries and has_ev and has_curl and has_ssl and has_xml and has_lua):
-        print("  Installing missing build toolchain and development headers via apt...")
+    print("[1/9] Verifying build dependencies...")
+    pkgs = ["build-essential", "git", "gcc", "make", "pkg-config", "libev-dev"]
+    needs_apt = any(shutil.which(p) is None for p in ["gcc", "make", "git", "pkg-config"])
+    if needs_apt:
+        print("  Installing missing build packages via apt...")
         subprocess.run(["apt-get", "update", "-qq"], check=True)
-        core_pkgs = ["build-essential", "git", "gcc", "make", "pkg-config", "libev-dev", "libssl-dev", "libxml2-dev"]
-        curl_pkgs = ["libcurl4-openssl-dev", "libcurl4-gnutls-dev", "libcurl-dev"]
-        lua_pkgs = ["liblua5.4-dev", "liblua5.3-dev", "liblua-dev"]
-        
-        chosen_curl = "libcurl4-openssl-dev"
-        for cpkg in curl_pkgs:
-            r = subprocess.run(["apt-get", "install", "-y", "-qq", "--dry-run", cpkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if r.returncode == 0:
-                chosen_curl = cpkg
-                break
-
-        chosen_lua = "liblua5.4-dev"
-        for lpkg in lua_pkgs:
-            r = subprocess.run(["apt-get", "install", "-y", "-qq", "--dry-run", lpkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if r.returncode == 0:
-                chosen_lua = lpkg
-                break
-
-        pkgs_to_install = core_pkgs + [chosen_curl, chosen_lua]
-        res = subprocess.run(["apt-get", "install", "-y", "-qq"] + pkgs_to_install, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if res.returncode != 0:
-            subprocess.run(["apt-get", "install", "-y"] + pkgs_to_install, check=True)
-        print(f"  [OK] Installed dependencies ({chosen_curl}, {chosen_lua}, libxml2-dev, libssl-dev, libev-dev).")
+        subprocess.run(["apt-get", "install", "-y", "-qq"] + pkgs, check=True)
     else:
-        print("  [OK] Build toolchain and development libraries already present.")
+        print("  [OK] Build toolchain already present.")
 
-    # Step 2: Handle NBFC-Linux & Systemd Service
-    print("[2/8] Setting up nbfc-linux & systemd unit...")
+    # Step 2: Clean up obsolete remnants from previous versions
+    print("[2/9] Cleaning up obsolete remnants from previous versions...")
+    cleanup_obsolete_remnants()
+
+    # Step 3: Handle NBFC-Linux & Systemd Service
+    print("[3/9] Setting up nbfc-linux & systemd unit...")
     if not shutil.which("nbfc"):
         print("  Cloning and building nbfc-linux from source...")
         tmp_dir = "/tmp/nbfc-linux-build"
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir)
         subprocess.run(["git", "clone", "https://github.com/nbfc-linux/nbfc-linux.git", tmp_dir], check=True)
-
-        # Patch nbfc-linux sources and Makefiles:
-        # 1. Disable Link-Time Optimization (-flto -> -fno-lto) to prevent GCC LTO crashes (e.g. GCC 16 lto1 ICE)
-        # 2. Fix missing lua bindings in src/ec_probe.c (upstream PR #183)
-        # 3. Append -llua, -ldl, -lm to src/ec_probe link command and append -lm to src/nbfc
-        
-        # Patch src/ec_probe.c:
-        # 1. Add missing lua_bindings.c include (upstream PR #183)
-        # 2. Fix static declaration of 'ec' following extern declaration in lua_bindings.c
-        ec_probe_src = os.path.join(tmp_dir, "src", "ec_probe.c")
-        if os.path.isfile(ec_probe_src):
-            try:
-                with open(ec_probe_src, "r") as f_ec:
-                    ec_content = f_ec.read()
-                if "lua_bindings.c" not in ec_content:
-                    if '#include "model_config.c"' in ec_content:
-                        ec_content = ec_content.replace('#include "model_config.c"', '#include "lua_bindings.c"\n#include "model_config.c"')
-                    else:
-                        ec_content = '#include "lua_bindings.c"\n' + ec_content
-                
-                # Fix "static declaration of 'ec' follows non-static declaration"
-                ec_content = re.sub(r'static\s+const\s+EC_VTable\s*\*\s*ec\s*;', 'const EC_VTable* ec;', ec_content)
-                
-                with open(ec_probe_src, "w") as f_ec:
-                    f_ec.write(ec_content)
-            except Exception as e:
-                print(f"  [WARNING] ec_probe.c patch error: {e}")
-
-        for root, _, files in os.walk(tmp_dir):
-            for fname in files:
-                if fname.startswith("Makefile") or fname.endswith(".mk"):
-                    fpath = os.path.join(root, fname)
-                    try:
-                        with open(fpath, "r", errors="ignore") as mf:
-                            mfc = mf.read()
-                        
-                        # 1. Disable Link-Time Optimization (-flto -> -fno-lto)
-                        mfc = mfc.replace("-flto", "-fno-lto")
-
-                        # 2. Identify Lua library flag in Makefile (e.g. -llua5.4)
-                        lua_lib_match = re.search(r"-llua[0-9.]*", mfc)
-                        lua_lib_flag = lua_lib_match.group(0) if lua_lib_match else "-llua5.4"
-
-                        # 3. Process line by line to append missing libraries ONLY to compiler recipe lines (not target/prerequisite lines)
-                        patched_lines = []
-                        for line in mfc.splitlines():
-                            is_recipe = (line.startswith("\t") or "cc " in line or "$(CC)" in line or "gcc " in line) and "-o " in line
-                            if is_recipe:
-                                # Fix src/client (nbfc CLI): must link -lm for roundf
-                                if "src/client.c" in line or "src/nbfc" in line or "-lcurl" in line:
-                                    if "-lm" not in line:
-                                        if " -s" in line:
-                                            line = line.replace(" -s", " -lm -s")
-                                        else:
-                                            line = line + " -lm"
-                                
-                                # Fix src/ec_probe: must link Lua, dl, and m
-                                if "src/ec_probe.c" in line or "src/ec_probe" in line:
-                                    if lua_lib_flag not in line:
-                                        line = line.replace("-o src/ec_probe", f"-o src/ec_probe {lua_lib_flag} -ldl -lm")
-                                    elif "-lm" not in line:
-                                        if " -s" in line:
-                                            line = line.replace(" -s", " -lm -s")
-                                        else:
-                                            line = line + " -lm"
-                            patched_lines.append(line)
-                        
-                        mfc = "\n".join(patched_lines) + "\n"
-                        with open(fpath, "w") as mf:
-                            mf.write(mfc)
-                    except Exception as e:
-                        print(f"  [WARNING] Makefile patch error on {fpath}: {e}")
-        print("  [OK] Patched nbfc-linux sources (-fno-lto, ec_probe lua bindings, -lm).")
-        
-        # Prepare build environment with Lua include flags, libm, and LTO disabled
-        build_env = os.environ.copy()
-        build_env["CFLAGS"] = ("-fno-lto " + build_env.get("CFLAGS", "")).strip()
-        build_env["LDFLAGS"] = ("-lm -fno-lto " + build_env.get("LDFLAGS", "")).strip()
-        build_env["LDLIBS"] = ("-lm " + build_env.get("LDLIBS", "")).strip()
-        lua_inc_dirs = []
-        for d in ["/usr/include/lua5.4", "/usr/include/lua5.3", "/usr/include/lua5.2", "/usr/include/lua5.1", "/usr/include/luajit-2.1"]:
-            if os.path.isfile(f"{d}/lua.h"):
-                lua_inc_dirs.append(d)
-        if lua_inc_dirs:
-            inc_flag = " ".join(f"-I{d}" for d in lua_inc_dirs)
-            build_env["CFLAGS"] = (inc_flag + " " + build_env.get("CFLAGS", "")).strip()
-            build_env["C_INCLUDE_PATH"] = (":".join(lua_inc_dirs) + (":" + build_env["C_INCLUDE_PATH"] if "C_INCLUDE_PATH" in build_env else "")).strip(":")
-            build_env["CPATH"] = (":".join(lua_inc_dirs) + (":" + build_env["CPATH"] if "CPATH" in build_env else "")).strip(":")
-
-        subprocess.run(["make", "-C", tmp_dir], env=build_env, check=True)
-        subprocess.run(["make", "-C", tmp_dir, "install"], env=build_env, check=True)
+        subprocess.run(["make", "-C", tmp_dir], check=True)
+        subprocess.run(["make", "-C", tmp_dir, "install"], check=True)
         shutil.rmtree(tmp_dir)
         print("  [OK] nbfc-linux compiled and installed.")
     else:
         print("  [OK] nbfc binary already installed.")
 
-    # Configure ec_sys write support so debugfs EC I/O allows writes
-    os.makedirs("/etc/modprobe.d", exist_ok=True)
-    with open("/etc/modprobe.d/ec_sys.conf", "w") as f_ec:
-        f_ec.write("options ec_sys write_support=1\n")
-    
-    os.makedirs("/etc/modules-load.d", exist_ok=True)
-    with open("/etc/modules-load.d/ec_sys.conf", "w") as f_ec:
-        f_ec.write("ec_sys\n")
-
-    if os.path.exists("/sys/module/ec_sys/parameters/write_support"):
-        try:
-            with open("/sys/module/ec_sys/parameters/write_support", "w") as f_ws:
-                f_ws.write("1\n")
-        except Exception:
-            pass
-    else:
-        subprocess.run(["modprobe", "ec_sys", "write_support=1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
     # Ensure all cores are online for coretemp binding
     set_core1_state(True)
     subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with open("/etc/modules-load.d/coretemp.conf", "w") as f:
-        f.write("coretemp\n")
+        f.write(f"# {MODEL_NAME} coretemp module config (managed by {SCRIPT_NAME})\ncoretemp\n")
 
     # Install dedicated prestart helper script
     prestart_bin = "/usr/local/bin/gpd-win-2-nbfc-prestart"
@@ -1118,14 +1115,14 @@ def run_install():
 
     nbfc_bin = shutil.which("nbfc") or "/usr/bin/nbfc"
     nbfc_service_bin = shutil.which("nbfc_service") or "/usr/bin/nbfc_service"
-    nbfc_service_content = f"""[Unit]
-Description=NoteBook FanControl service (nbfc-linux)
+    nbfc_service_content = f"""# {MODEL_NAME} NoteBook FanControl service (managed by {SCRIPT_NAME})
+[Unit]
+Description=NoteBook FanControl service (nbfc-linux for {MODEL_NAME}, managed by {SCRIPT_NAME})
 After=syslog.target network.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-RestartPreventExitStatus=77
 ExecStartPre={prestart_bin}
 ExecStart={nbfc_service_bin}
 ExecStopPost=/bin/rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
@@ -1142,156 +1139,81 @@ WantedBy=multi-user.target
         dpath = f"/etc/systemd/system/{svc}"
         os.makedirs(dpath, exist_ok=True)
         with open(f"{dpath}/restart.conf", "w") as f:
-            f.write("[Service]\nRestart=always\nRestartSec=3s\nRestartPreventExitStatus=77\n")
+            f.write(f"# Restart configuration for {MODEL_NAME} (managed by {SCRIPT_NAME})\n[Service]\nRestart=always\nRestartSec=3s\n")
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
 
-    # Symlink binaries to /usr/bin if installed in /usr/local/bin
-    for b in ["nbfc", "nbfc_service"]:
-        p = shutil.which(b)
-        if p and p != f"/usr/bin/{b}":
-            try:
-                if not os.path.exists(f"/usr/bin/{b}"):
-                    os.symlink(p, f"/usr/bin/{b}")
-            except Exception:
-                pass
-
-    # Ensure profile symlink so both 'GPD Win 2.json' and 'GPD Win 2 (8100y).json' exist
-    for cfg_dir in ["/usr/share/nbfc/configs", "/etc/nbfc/configs"]:
-        if os.path.isdir(cfg_dir):
-            f_8100y = os.path.join(cfg_dir, "GPD Win 2 (8100y).json")
-            f_plain = os.path.join(cfg_dir, "GPD Win 2.json")
-            if os.path.isfile(f_8100y) and not os.path.exists(f_plain):
-                try:
-                    os.symlink("GPD Win 2 (8100y).json", f_plain)
-                    print(f"  [OK] Symlinked {f_plain} -> GPD Win 2 (8100y).json")
-                except Exception:
-                    pass
-            elif os.path.isfile(f_plain) and not os.path.exists(f_8100y):
-                try:
-                    os.symlink("GPD Win 2.json", f_8100y)
-                    print(f"  [OK] Symlinked {f_8100y} -> GPD Win 2.json")
-                except Exception:
-                    pass
-
-    # Set default config to GPD Win 2 (8100y) which exists in nbfc-linux and applies to all Win 2 revisions
-    os.makedirs("/etc/nbfc", exist_ok=True)
-    cfg_id = "GPD Win 2 (8100y)"
-    cfg_payload = '{\n  "SelectedConfigId": "' + cfg_id + '"\n}\n'
-    for cpath in ["/etc/nbfc/nbfc_service.json", "/etc/nbfc/nbfc.json"]:
-        with open(cpath, "w") as f_cfg:
-            f_cfg.write(cfg_payload)
-    print(f"  [OK] Pre-configured NBFC profile: {cfg_id} (wrote nbfc_service.json & nbfc.json)")
-
-    # Multi-Machine Safety Lock: Wrap nbfc_service at binary level so it CANNOT run on foreign hardware
-    wrapper_script = """#!/bin/sh
-# GPD WIN 2 HARDWARE SAFETY LOCK
-# Strictly abort if booted on non-Win 2 hardware (such as GPD Pocket 3 or other PCs)
-# to prevent writing mismatched fan register offsets to a foreign Embedded Controller.
-if ! grep -E -i -q '7y30|8100y' /proc/cpuinfo 2>/dev/null; then
-    echo "[ERROR] nbfc_service is hardware-locked to GPD Win 2. Aborting to protect foreign EC." >&2
-    exit 77
-fi
-TARGET_REAL="$(dirname "$0")/nbfc_service.real"
-if [ ! -x "$TARGET_REAL" ]; then
-    TARGET_REAL="/usr/local/bin/nbfc_service.real"
-fi
-exec "$TARGET_REAL" "$@"
-"""
-    for bdir in ["/usr/local/bin", "/usr/bin"]:
-        real_bin = os.path.join(bdir, "nbfc_service")
-        target_real = os.path.join(bdir, "nbfc_service.real")
-        if os.path.isfile(real_bin) and not os.path.islink(real_bin):
-            try:
-                with open(real_bin, "rb") as f_chk:
-                    hdr = f_chk.read(16)
-                if not hdr.startswith(b"#!/bin/sh"):
-                    os.replace(real_bin, target_real)
-                    os.chmod(target_real, 0o755)
-                    with open(real_bin, "w") as f_wrp:
-                        f_wrp.write(wrapper_script)
-                    os.chmod(real_bin, 0o755)
-                    print(f"  [OK] Applied hardware safety lock wrapper to {real_bin}")
-            except Exception as e:
-                print(f"  [WARNING] Could not wrap {real_bin}: {e}")
-
-    subprocess.run(["systemctl", "enable", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if is_target_hardware():
-        subprocess.run(["systemctl", "restart", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # Wait up to 3 seconds for UNIX socket to initialize
-        for _ in range(15):
-            if os.path.exists("/var/run/nbfc_service.socket") or os.path.exists("/run/nbfc_service.socket"):
-                break
-            time.sleep(0.2)
-        # Verify status
-        res = subprocess.run([nbfc_bin, "status"], capture_output=True, text=True)
-        if res.returncode == 0:
-            print(f"  [OK] nbfc_service is active and responding on UNIX socket.")
+        subprocess.run(["systemctl", "enable", "--now", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        res = subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2 (8100y)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode != 0:
+            subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # Step 3: Write & Compile Early Power Watchdog C binary
-    print("[3/8] Compiling namespaced early_power_watchdog C micro-daemon...")
+    # Step 4: Write & Compile Early Power Watchdog C binary
+    print("[4/9] Compiling namespaced early_power_watchdog C micro-daemon...")
     os.makedirs("/usr/local/src", exist_ok=True)
     c_src = "/usr/local/src/gpd-win-2-power-watchdog.c"
     with open(c_src, "w") as f:
         f.write(C_WATCHDOG_PAYLOAD)
-    
+
     bin_target = "/usr/local/bin/gpd-win-2-power-watchdog"
     subprocess.run(["gcc", "-O2", c_src, "-o", bin_target], check=True)
     os.chmod(bin_target, 0o755)
     print("  [OK] /usr/local/bin/gpd-win-2-power-watchdog ready.")
 
-    # Step 4: Write Namespaced Initramfs Hooks
-    print("[4/8] Installing Initramfs early power management hooks...")
-    
-    # 4a. Binary Hook
+    # Step 5: Write Namespaced Initramfs Hooks
+    print("[5/9] Installing Initramfs early power management hooks...")
+
+    # 5a. Binary Hook
     hook_path = "/etc/initramfs-tools/hooks/gpd_win_2_power"
     with open(hook_path, "w") as f:
-        f.write("#!/bin/sh\nPREREQ=\"\"\nprereqs() { echo \"$PREREQ\"; }\ncase \"$1\" in prereqs) prereqs; exit 0;; esac\n. /usr/share/initramfs-tools/hook-functions\nif [ -f /usr/local/bin/gpd-win-2-power-watchdog ]; then\n    copy_exec /usr/local/bin/gpd-win-2-power-watchdog /bin\nfi\nexit 0\n")
+        f.write(f"#!/bin/sh\n# {MODEL_NAME} Initramfs Binary Hook\n# Installed and managed by {SCRIPT_NAME}\nPREREQ=\"\"\nprereqs() {{ echo \"$PREREQ\"; }}\ncase \"$1\" in prereqs) prereqs; exit 0;; esac\n. /usr/share/initramfs-tools/hook-functions\nif [ -f /usr/local/bin/gpd-win-2-power-watchdog ]; then\n    copy_exec /usr/local/bin/gpd-win-2-power-watchdog /bin\nfi\nexit 0\n")
     os.chmod(hook_path, 0o755)
 
-    # 4b. Init-top Script
+    # 5b. Init-top Script
     top_path = "/etc/initramfs-tools/scripts/init-top/gpd_win_2_power"
     with open(top_path, "w") as f:
-        f.write("#!/bin/sh\nPREREQ=\"udev\"\nprereqs() { echo \"$PREREQ\"; }\ncase \"$1\" in prereqs) prereqs; exit 0;; esac\n. /scripts/functions\nif [ -x /bin/gpd-win-2-power-watchdog ]; then\n    /bin/gpd-win-2-power-watchdog &\n    echo \"$!\" > /run/gpd_win_2_watchdog.pid\nfi\n")
+        f.write(f"#!/bin/sh\n# {MODEL_NAME} Early Watchdog Launcher (init-top)\n# Installed and managed by {SCRIPT_NAME}\nPREREQ=\"udev\"\nprereqs() {{ echo \"$PREREQ\"; }}\ncase \"$1\" in prereqs) prereqs; exit 0;; esac\n. /scripts/functions\nif [ -x /bin/gpd-win-2-power-watchdog ]; then\n    /bin/gpd-win-2-power-watchdog &\n    echo \"$!\" > /run/gpd_win_2_watchdog.pid\nfi\n")
     os.chmod(top_path, 0o755)
 
-    # 4c. Init-bottom Script
+    # 5c. Init-bottom Script
     bottom_path = "/etc/initramfs-tools/scripts/init-bottom/gpd_win_2_power"
     with open(bottom_path, "w") as f:
-        f.write("#!/bin/sh\nPREREQ=\"\"\nprereqs() { echo \"$PREREQ\"; }\ncase \"$1\" in prereqs) prereqs; exit 0;; esac\n. /scripts/functions\nPIDFILE=\"/run/gpd_win_2_watchdog.pid\"\nif [ -f \"$PIDFILE\" ]; then\n    PID=$(cat \"$PIDFILE\")\n    if [ -n \"$PID\" ]; then\n        kill -TERM \"$PID\" 2>/dev/null || true\n    fi\n    rm -f \"$PIDFILE\"\nfi\n")
+        f.write(f"#!/bin/sh\n# {MODEL_NAME} Watchdog Handoff Script (init-bottom)\n# Installed and managed by {SCRIPT_NAME}\nPREREQ=\"\"\nprereqs() {{ echo \"$PREREQ\"; }}\ncase \"$1\" in prereqs) prereqs; exit 0;; esac\n. /scripts/functions\nPIDFILE=\"/run/gpd_win_2_watchdog.pid\"\nif [ -f \"$PIDFILE\" ]; then\n    PID=$(cat \"$PIDFILE\")\n    if [ -n \"$PID\" ]; then\n        kill -TERM \"$PID\" 2>/dev/null || true\n    fi\n    rm -f \"$PIDFILE\"\nfi\n")
     os.chmod(bottom_path, 0o755)
 
-    # Step 5: Enforce Initramfs Modules
-    print("[5/8] Validating /etc/initramfs-tools/modules...")
+    # Step 6: Enforce Initramfs Modules using Debian Guard Blocks
+    print("[6/9] Updating /etc/initramfs-tools/modules with Debian-safe guard blocks...")
     required_modules = ["i915", "button", "i8042", "evdev", "intel_lpss_pci", "coretemp"]
-    modules_file = "/etc/initramfs-tools/modules"
-    existing = ""
-    if os.path.exists(modules_file):
-        with open(modules_file, "r") as f:
-            existing = f.read()
+    update_guarded_config("/etc/initramfs-tools/modules", f"{MODEL_NAME} MODULES", required_modules)
+    print("  [OK] Preserved existing /etc/initramfs-tools/modules contents.")
 
-    with open(modules_file, "a") as f:
-        for mod in required_modules:
-            if mod not in existing:
-                f.write(f"{mod}\n")
-                print(f"  Appended module: {mod}")
-
-    # Step 6: Rebuild Ramdisk
-    print("[6/8] Rebuilding Initramfs...")
+    # Step 7: Rebuild Ramdisk
+    print("[7/9] Rebuilding Initramfs...")
     subprocess.run(["update-initramfs", "-u"], check=True)
 
-    # Step 7: Install namespaced lowpower utility
-    print("[7/8] Installing /usr/local/bin/gpd-win-2-lowpower...")
+    # Step 8: Install lowpower utility & system-sleep hibernate fix
+    print("[8/9] Installing lowpower utility and system-sleep hibernate fix...")
     lp_path = "/usr/local/bin/gpd-win-2-lowpower"
     with open(lp_path, "w") as f:
         f.write(LOWPOWER_PAYLOAD)
     os.chmod(lp_path, 0o755)
 
-    # Step 8: Install Governor and Systemd Service
-    print("[8/8] Installing gpd-win-2-governor and systemd service...")
+    sleep_dir = "/lib/systemd/system-sleep"
+    if not os.path.exists(sleep_dir):
+        sleep_dir = "/usr/lib/systemd/system-sleep"
+    os.makedirs(sleep_dir, exist_ok=True)
+    sleep_hook = os.path.join(sleep_dir, "gpd-win-2-sleep")
+    with open(sleep_hook, "w") as f:
+        f.write(GPD_SLEEP_PAYLOAD)
+    os.chmod(sleep_hook, 0o755)
+
+    # Step 9: Install Governor and Systemd Service
+    print("[9/9] Installing gpd-win-2-governor and systemd service...")
     src_file = os.path.abspath(__file__)
     dest_gov = "/usr/local/bin/gpd-win-2-governor"
-    
+
     if os.path.abspath(src_file) != os.path.abspath(dest_gov):
         shutil.copyfile(src_file, dest_gov)
     os.chmod(dest_gov, 0o755)
@@ -1310,16 +1232,17 @@ exec "$TARGET_REAL" "$@"
         f.write(GPD_GOVERNOR_SERVICE)
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "enable", "gpd-win-2-governor.service"], check=True)
     if is_target_hardware():
-        subprocess.run(["systemctl", "start", "gpd-win-2-governor.service"], check=True)
+        subprocess.run(["systemctl", "enable", "--now", "gpd-win-2-governor.service"], check=True)
 
-    print("\n[SUCCESS] Universal GPD Win 2 Stack Installed!")
+    print(f"\n[SUCCESS] {MODEL_NAME} Stack Installed!")
+    print(f"          (Managed by {SCRIPT_NAME})")
     print("--------------------------------------------------------------------")
     print(" * NBFC Service:      nbfc_service.service (Active & Supervised)")
     print(" * Watchdog Binary:   /usr/local/bin/gpd-win-2-power-watchdog")
     print(" * Governor Binary:   /usr/local/bin/gpd-win-2-governor")
-    print(" * Low-Power Toggle:  gpd-win-2-lowpower [on|off]")
+    print(" * Low-Power Toggle:  gpd-win-2-lowpower [on|off|status] (Persistent)")
+    print(" * Sleep/Hibernate:   CPU hotplug & EC synchronization hook enabled")
     print(" * Systemd Unit:      gpd-win-2-governor.service")
     print(" * Sensor Linkage:    Auto-restores topology for coretemp binding")
     print("--------------------------------------------------------------------\n")
