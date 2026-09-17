@@ -33,6 +33,7 @@ SCRIPT_NAME = "gpd-win-2-governor.py"
 MODEL_NAME = "GPD Win 2 (Intel Core m3-7Y30 / m3-8100Y)"
 STATE_FILE = "/etc/gpd-win-2-lowpower.state"
 
+
 # =====================================================================
 # PRIVILEGE ELEVATION & HARDWARE VALIDATION
 # =====================================================================
@@ -45,6 +46,7 @@ def ensure_root():
         except Exception as e:
             print(f"[ERROR] [{SCRIPT_NAME}] Failed to auto-elevate with sudo: {e}")
             sys.exit(1)
+
 
 def is_target_hardware():
     """
@@ -60,6 +62,7 @@ def is_target_hardware():
         pass
     return False
 
+
 def is_lowpower_state_enabled():
     """Checks if low-power mode has been persistently configured."""
     try:
@@ -69,6 +72,7 @@ def is_lowpower_state_enabled():
     except Exception:
         pass
     return False
+
 
 # =====================================================================
 # PART 1: THERMAL GOVERNOR RUNTIME
@@ -86,6 +90,7 @@ PCT_MAX_PERF = 100
 PCT_SILENT_LOW = 40
 PCT_CHARGING_CAP = 55
 
+
 def get_cpu_thermal_zone_path():
     base_path = "/sys/class/thermal"
     try:
@@ -98,6 +103,7 @@ def get_cpu_thermal_zone_path():
         pass
     return "/sys/class/thermal/thermal_zone6/temp"
 
+
 def set_core1_state(online):
     for cpu in (1, 3):
         path = f"/sys/devices/system/cpu/cpu{cpu}/online"
@@ -108,12 +114,14 @@ def set_core1_state(online):
             except IOError:
                 pass
 
+
 def check_core1_hardware_state():
     try:
         with open("/sys/devices/system/cpu/cpu1/online", "r") as f:
             return f.read().strip() == "1"
     except Exception:
         return True
+
 
 def apply_pstate_limit(percentage):
     try:
@@ -124,6 +132,7 @@ def apply_pstate_limit(percentage):
     except Exception:
         pass
 
+
 def set_turbo_state(enabled):
     pstate_no_turbo = "/sys/devices/system/cpu/intel_pstate/no_turbo"
     if os.path.exists(pstate_no_turbo):
@@ -132,6 +141,7 @@ def set_turbo_state(enabled):
                 f.write("1" if not enabled else "0")
         except IOError:
             pass
+
 
 def set_scaling_governor(governor_string):
     try:
@@ -143,6 +153,7 @@ def set_scaling_governor(governor_string):
     except Exception:
         pass
 
+
 def set_gpu_max_freq(mhz):
     try:
         path = "/sys/class/drm/card0/gt_max_freq_mhz"
@@ -151,6 +162,7 @@ def set_gpu_max_freq(mhz):
                 f.write(str(mhz))
     except Exception:
         pass
+
 
 def get_battery_metrics():
     capacity = 100
@@ -166,19 +178,31 @@ def get_battery_metrics():
         pass
     return capacity, is_charging
 
+
 def restart_nbfc():
     """Brings cores online temporarily to guarantee coretemp sensor re-binding."""
     saved_state = check_core1_hardware_state()
     set_core1_state(True)
-    subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
     time.sleep(0.3)
-    subprocess.run(["systemctl", "restart", "nbfc_service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["systemctl", "restart", "nbfc_service"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     if not saved_state:
         time.sleep(0.5)
         set_core1_state(False)
 
+
 def set_nbfc_fan(mode):
-    cmd = ["/usr/bin/nbfc", "set", "-s", "100"] if mode == "100" else ["/usr/bin/nbfc", "set", "-a"]
+    cmd = (
+        ["/usr/bin/nbfc", "set", "-s", "100"]
+        if mode == "100"
+        else ["/usr/bin/nbfc", "set", "-a"]
+    )
     try:
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode != 0:
@@ -188,11 +212,14 @@ def set_nbfc_fan(mode):
     except Exception:
         restart_nbfc()
 
+
 def run_governor():
     ensure_root()
 
     if not is_target_hardware():
-        print(f"[{SCRIPT_NAME}] Non-target hardware detected. Halting safely with 0% overhead.")
+        print(
+            f"[{SCRIPT_NAME}] Non-target hardware detected. Halting safely with 0% overhead."
+        )
         sys.exit(0)
 
     print(f"{MODEL_NAME} Dynamic Thermal Governor Online.")
@@ -208,7 +235,11 @@ def run_governor():
         try:
             current_time = time.time()
             if current_time - last_nbfc_check > 15:
-                res = subprocess.run(["/usr/bin/nbfc", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                res = subprocess.run(
+                    ["/usr/bin/nbfc", "status"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
                 if res.returncode != 0:
                     restart_nbfc()
                 last_nbfc_check = current_time
@@ -233,7 +264,9 @@ def run_governor():
             cpu_cnt = os.cpu_count() or 4
             normalized_load = load1 / cpu_cnt
 
-            is_critically_low = (not is_charging and capacity <= 10) or (is_charging and capacity <= 5)
+            is_critically_low = (not is_charging and capacity <= 10) or (
+                is_charging and capacity <= 5
+            )
 
             if is_critically_low:
                 if core1_is_online:
@@ -251,16 +284,24 @@ def run_governor():
                 forced_emergency_core_drop = True
                 last_core_drop_time = current_time
                 set_nbfc_fan("100")
-                print(f"[{time.strftime('%H:%M:%S')}] STAGE 2 BREAK: Temp {temp}C. Disabling Core 1 + Fan Boost.")
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] STAGE 2 BREAK: Temp {temp}C. Disabling Core 1 + Fan Boost."
+                )
                 time.sleep(0.5)
                 continue
 
-            if forced_emergency_core_drop and temp <= CORE_RESTORE_TEMP and (current_time - last_core_drop_time > 15):
+            if (
+                forced_emergency_core_drop
+                and temp <= CORE_RESTORE_TEMP
+                and (current_time - last_core_drop_time > 15)
+            ):
                 set_core1_state(True)
                 core1_is_online = True
                 forced_emergency_core_drop = False
                 set_nbfc_fan("auto")
-                print(f"[{time.strftime('%H:%M:%S')}] STAGE 2 SAFE: Temp {temp}C. Core 1 Restored.")
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] STAGE 2 SAFE: Temp {temp}C. Core 1 Restored."
+                )
 
             if not forced_emergency_core_drop:
                 if normalized_load <= IDLE_LOAD_THRESHOLD:
@@ -279,21 +320,31 @@ def run_governor():
                     if temp >= TURBO_DROP_TEMP and turbo_is_enabled:
                         set_turbo_state(False)
                         turbo_is_enabled = False
-                        print(f"[{time.strftime('%H:%M:%S')}] STAGE 1 CUTOFF: Temp {temp}C. Disabling Turbo.")
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] STAGE 1 CUTOFF: Temp {temp}C. Disabling Turbo."
+                        )
                     elif temp <= TURBO_RESTORE_TEMP and not turbo_is_enabled:
                         set_turbo_state(True)
                         turbo_is_enabled = True
-                        print(f"[{time.strftime('%H:%M:%S')}] STAGE 1 RESTORE: Temp {temp}C. Turbo Allowed.")
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] STAGE 1 RESTORE: Temp {temp}C. Turbo Allowed."
+                        )
 
                     max_possible_pct = PCT_CHARGING_CAP if is_charging else PCT_MAX_PERF
                     if normalized_load >= HEAVY_LOAD_THRESHOLD:
                         current_max_pct = max_possible_pct
                     else:
-                        scale = (normalized_load - IDLE_LOAD_THRESHOLD) / (HEAVY_LOAD_THRESHOLD - IDLE_LOAD_THRESHOLD)
-                        current_max_pct = PCT_SILENT_LOW + (scale * (max_possible_pct - PCT_SILENT_LOW))
+                        scale = (normalized_load - IDLE_LOAD_THRESHOLD) / (
+                            HEAVY_LOAD_THRESHOLD - IDLE_LOAD_THRESHOLD
+                        )
+                        current_max_pct = PCT_SILENT_LOW + (
+                            scale * (max_possible_pct - PCT_SILENT_LOW)
+                        )
 
                     if temp >= THROTTLE_START_TEMP:
-                        overshoot = (temp - THROTTLE_START_TEMP) / (CORE_DROP_TEMP - THROTTLE_START_TEMP)
+                        overshoot = (temp - THROTTLE_START_TEMP) / (
+                            CORE_DROP_TEMP - THROTTLE_START_TEMP
+                        )
                         reduction = overshoot * (current_max_pct - PCT_SILENT_LOW)
                         target_pct = max(PCT_SILENT_LOW, current_max_pct - reduction)
                     else:
@@ -304,6 +355,7 @@ def run_governor():
         except Exception:
             pass
         time.sleep(0.5)
+
 
 # =====================================================================
 # PART 2: EMBEDDED NAMESPACED PAYLOADS
@@ -477,7 +529,7 @@ void init_backlight(void) {
         fclose(f);
     }
     user_brightness = calculate_brightness(current_step);
-    log_msg("Backlight initialized: Max=%d, Min=%d, StepSize=%d, Normal=%d (Step %d/%d)", 
+    log_msg("Backlight initialized: Max=%d, Min=%d, StepSize=%d, Normal=%d (Step %d/%d)",
             max_brightness, min_brightness, step_size, user_brightness, current_step, TOTAL_STEPS);
     set_brightness(user_brightness);
 }
@@ -486,7 +538,7 @@ void brightness_step_up(void) {
     if (current_step < TOTAL_STEPS) {
         current_step++;
         user_brightness = calculate_brightness(current_step);
-        log_msg("Hotkey UP -> %d (Step %d/%d, %d%%)", 
+        log_msg("Hotkey UP -> %d (Step %d/%d, %d%%)",
                 user_brightness, current_step, TOTAL_STEPS, current_step * 5);
     }
     set_brightness(user_brightness);
@@ -496,7 +548,7 @@ void brightness_step_down(void) {
     if (current_step > 0) {
         current_step--;
         user_brightness = calculate_brightness(current_step);
-        log_msg("Hotkey DOWN -> %d (Step %d/%d, %d%%)", 
+        log_msg("Hotkey DOWN -> %d (Step %d/%d, %d%%)",
                 user_brightness, current_step, TOTAL_STEPS, current_step * 5);
     }
     set_brightness(user_brightness);
@@ -995,6 +1047,7 @@ RestartSec=3s
 WantedBy=multi-user.target
 """
 
+
 # =====================================================================
 # CONFIGURATION GUARD BLOCK HELPER (Debian-Safe)
 # =====================================================================
@@ -1011,7 +1064,7 @@ def update_guarded_config(file_path, block_tag, lines_to_set):
 
     pattern = re.compile(
         rf"### BEGIN {re.escape(block_tag)}.*?###\n.*?### END {re.escape(block_tag)}.*?###\n?",
-        re.DOTALL
+        re.DOTALL,
     )
     if pattern.search(existing):
         updated = pattern.sub(block_content, existing)
@@ -1023,6 +1076,7 @@ def update_guarded_config(file_path, block_tag, lines_to_set):
     os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
     with open(file_path, "w") as f:
         f.write(updated)
+
 
 def cleanup_obsolete_remnants():
     """Removes obsolete files, deprecated hook names, and stale artifacts from older versions."""
@@ -1054,9 +1108,11 @@ def cleanup_obsolete_remnants():
         except Exception:
             pass
 
+
 # =====================================================================
 # PART 3: AUTOMATED INSTALLER ENGINE (--install)
 # =====================================================================
+
 
 def run_install():
     ensure_root()
@@ -1068,13 +1124,19 @@ def run_install():
 
     if not is_target_hardware():
         print(f"[WARNING] Host hardware is NOT a {MODEL_NAME}.")
-        print("          Proceeding with installation for portable USB drive deployment.")
-        print("          (Hardware guards will ensure these scripts remain dormant on other PCs).\n")
+        print(
+            "          Proceeding with installation for portable USB drive deployment."
+        )
+        print(
+            "          (Hardware guards will ensure these scripts remain dormant on other PCs).\n"
+        )
 
     # Step 1: Install build prerequisites only if missing
     print("[1/9] Verifying build dependencies...")
     pkgs = ["build-essential", "git", "gcc", "make", "pkg-config", "libev-dev"]
-    needs_apt = any(shutil.which(p) is None for p in ["gcc", "make", "git", "pkg-config"])
+    needs_apt = any(
+        shutil.which(p) is None for p in ["gcc", "make", "git", "pkg-config"]
+    )
     if needs_apt:
         print("  Installing missing build packages via apt...")
         subprocess.run(["apt-get", "update", "-qq"], check=True)
@@ -1093,7 +1155,10 @@ def run_install():
         tmp_dir = "/tmp/nbfc-linux-build"
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir)
-        subprocess.run(["git", "clone", "https://github.com/nbfc-linux/nbfc-linux.git", tmp_dir], check=True)
+        subprocess.run(
+            ["git", "clone", "https://github.com/nbfc-linux/nbfc-linux.git", tmp_dir],
+            check=True,
+        )
         subprocess.run(["make", "-C", tmp_dir], check=True)
         subprocess.run(["make", "-C", tmp_dir, "install"], check=True)
         shutil.rmtree(tmp_dir)
@@ -1103,9 +1168,13 @@ def run_install():
 
     # Ensure all cores are online for coretemp binding
     set_core1_state(True)
-    subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
     with open("/etc/modules-load.d/coretemp.conf", "w") as f:
-        f.write(f"# {MODEL_NAME} coretemp module config (managed by {SCRIPT_NAME})\ncoretemp\n")
+        f.write(
+            f"# {MODEL_NAME} coretemp module config (managed by {SCRIPT_NAME})\ncoretemp\n"
+        )
 
     # Install dedicated prestart helper script
     prestart_bin = "/usr/local/bin/gpd-win-2-nbfc-prestart"
@@ -1139,16 +1208,30 @@ WantedBy=multi-user.target
         dpath = f"/etc/systemd/system/{svc}"
         os.makedirs(dpath, exist_ok=True)
         with open(f"{dpath}/restart.conf", "w") as f:
-            f.write(f"# Restart configuration for {MODEL_NAME} (managed by {SCRIPT_NAME})\n[Service]\nRestart=always\nRestartSec=3s\n")
+            f.write(
+                f"# Restart configuration for {MODEL_NAME} (managed by {SCRIPT_NAME})\n[Service]\nRestart=always\nRestartSec=3s\n"
+            )
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
 
     if is_target_hardware():
-        subprocess.run(["systemctl", "enable", "--now", "nbfc_service.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["systemctl", "enable", "--now", "nbfc_service.service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         time.sleep(1)
-        res = subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2 (8100y)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        res = subprocess.run(
+            [nbfc_bin, "config", "--set", "GPD Win 2 (8100y)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         if res.returncode != 0:
-            subprocess.run([nbfc_bin, "config", "--set", "GPD Win 2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                [nbfc_bin, "config", "--set", "GPD Win 2"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
     # Step 4: Write & Compile Early Power Watchdog C binary
     print("[4/9] Compiling namespaced early_power_watchdog C micro-daemon...")
@@ -1168,25 +1251,42 @@ WantedBy=multi-user.target
     # 5a. Binary Hook
     hook_path = "/etc/initramfs-tools/hooks/gpd_win_2_power"
     with open(hook_path, "w") as f:
-        f.write(f"#!/bin/sh\n# {MODEL_NAME} Initramfs Binary Hook\n# Installed and managed by {SCRIPT_NAME}\nPREREQ=\"\"\nprereqs() {{ echo \"$PREREQ\"; }}\ncase \"$1\" in prereqs) prereqs; exit 0;; esac\n. /usr/share/initramfs-tools/hook-functions\nif [ -f /usr/local/bin/gpd-win-2-power-watchdog ]; then\n    copy_exec /usr/local/bin/gpd-win-2-power-watchdog /bin\nfi\nexit 0\n")
+        f.write(
+            f'#!/bin/sh\n# {MODEL_NAME} Initramfs Binary Hook\n# Installed and managed by {SCRIPT_NAME}\nPREREQ=""\nprereqs() {{ echo "$PREREQ"; }}\ncase "$1" in prereqs) prereqs; exit 0;; esac\n. /usr/share/initramfs-tools/hook-functions\nif [ -f /usr/local/bin/gpd-win-2-power-watchdog ]; then\n    copy_exec /usr/local/bin/gpd-win-2-power-watchdog /bin\nfi\nexit 0\n'
+        )
     os.chmod(hook_path, 0o755)
 
     # 5b. Init-top Script
     top_path = "/etc/initramfs-tools/scripts/init-top/gpd_win_2_power"
     with open(top_path, "w") as f:
-        f.write(f"#!/bin/sh\n# {MODEL_NAME} Early Watchdog Launcher (init-top)\n# Installed and managed by {SCRIPT_NAME}\nPREREQ=\"udev\"\nprereqs() {{ echo \"$PREREQ\"; }}\ncase \"$1\" in prereqs) prereqs; exit 0;; esac\n. /scripts/functions\nif [ -x /bin/gpd-win-2-power-watchdog ]; then\n    /bin/gpd-win-2-power-watchdog &\n    echo \"$!\" > /run/gpd_win_2_watchdog.pid\nfi\n")
+        f.write(
+            f'#!/bin/sh\n# {MODEL_NAME} Early Watchdog Launcher (init-top)\n# Installed and managed by {SCRIPT_NAME}\nPREREQ="udev"\nprereqs() {{ echo "$PREREQ"; }}\ncase "$1" in prereqs) prereqs; exit 0;; esac\n. /scripts/functions\nif [ -x /bin/gpd-win-2-power-watchdog ]; then\n    /bin/gpd-win-2-power-watchdog &\n    echo "$!" > /run/gpd_win_2_watchdog.pid\nfi\n'
+        )
     os.chmod(top_path, 0o755)
 
     # 5c. Init-bottom Script
     bottom_path = "/etc/initramfs-tools/scripts/init-bottom/gpd_win_2_power"
     with open(bottom_path, "w") as f:
-        f.write(f"#!/bin/sh\n# {MODEL_NAME} Watchdog Handoff Script (init-bottom)\n# Installed and managed by {SCRIPT_NAME}\nPREREQ=\"\"\nprereqs() {{ echo \"$PREREQ\"; }}\ncase \"$1\" in prereqs) prereqs; exit 0;; esac\n. /scripts/functions\nPIDFILE=\"/run/gpd_win_2_watchdog.pid\"\nif [ -f \"$PIDFILE\" ]; then\n    PID=$(cat \"$PIDFILE\")\n    if [ -n \"$PID\" ]; then\n        kill -TERM \"$PID\" 2>/dev/null || true\n    fi\n    rm -f \"$PIDFILE\"\nfi\n")
+        f.write(
+            f'#!/bin/sh\n# {MODEL_NAME} Watchdog Handoff Script (init-bottom)\n# Installed and managed by {SCRIPT_NAME}\nPREREQ=""\nprereqs() {{ echo "$PREREQ"; }}\ncase "$1" in prereqs) prereqs; exit 0;; esac\n. /scripts/functions\nPIDFILE="/run/gpd_win_2_watchdog.pid"\nif [ -f "$PIDFILE" ]; then\n    PID=$(cat "$PIDFILE")\n    if [ -n "$PID" ]; then\n        kill -TERM "$PID" 2>/dev/null || true\n    fi\n    rm -f "$PIDFILE"\nfi\n'
+        )
     os.chmod(bottom_path, 0o755)
 
     # Step 6: Enforce Initramfs Modules using Debian Guard Blocks
-    print("[6/9] Updating /etc/initramfs-tools/modules with Debian-safe guard blocks...")
-    required_modules = ["i915", "button", "i8042", "evdev", "intel_lpss_pci", "coretemp"]
-    update_guarded_config("/etc/initramfs-tools/modules", f"{MODEL_NAME} MODULES", required_modules)
+    print(
+        "[6/9] Updating /etc/initramfs-tools/modules with Debian-safe guard blocks..."
+    )
+    required_modules = [
+        "i915",
+        "button",
+        "i8042",
+        "evdev",
+        "intel_lpss_pci",
+        "coretemp",
+    ]
+    update_guarded_config(
+        "/etc/initramfs-tools/modules", f"{MODEL_NAME} MODULES", required_modules
+    )
     print("  [OK] Preserved existing /etc/initramfs-tools/modules contents.")
 
     # Step 7: Rebuild Ramdisk
@@ -1233,7 +1333,9 @@ WantedBy=multi-user.target
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     if is_target_hardware():
-        subprocess.run(["systemctl", "enable", "--now", "gpd-win-2-governor.service"], check=True)
+        subprocess.run(
+            ["systemctl", "enable", "--now", "gpd-win-2-governor.service"], check=True
+        )
 
     print(f"\n[SUCCESS] {MODEL_NAME} Stack Installed!")
     print(f"          (Managed by {SCRIPT_NAME})")
@@ -1246,6 +1348,7 @@ WantedBy=multi-user.target
     print(" * Systemd Unit:      gpd-win-2-governor.service")
     print(" * Sensor Linkage:    Auto-restores topology for coretemp binding")
     print("--------------------------------------------------------------------\n")
+
 
 # =====================================================================
 # ENTRY POINT ROUTER
