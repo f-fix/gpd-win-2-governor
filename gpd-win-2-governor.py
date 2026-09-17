@@ -200,6 +200,38 @@ def get_nbfc_service_bin():
     )
 
 
+def ensure_ec_sys_write_support():
+    try:
+        if not os.path.ismount("/sys/kernel/debug"):
+            subprocess.run(
+                ["mount", "-t", "debugfs", "none", "/sys/kernel/debug"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        ws_path = "/sys/module/ec_sys/parameters/write_support"
+        if os.path.exists(ws_path):
+            with open(ws_path, "r") as f:
+                if f.read().strip() not in ["Y", "1"]:
+                    subprocess.run(
+                        ["modprobe", "-r", "ec_sys"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    subprocess.run(
+                        ["modprobe", "ec_sys", "write_support=1"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+        else:
+            subprocess.run(
+                ["modprobe", "ec_sys", "write_support=1"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
+
+
 def restart_nbfc():
     """Brings cores online temporarily to guarantee coretemp sensor re-binding and restarts NBFC."""
     if not is_target_hardware():
@@ -210,6 +242,7 @@ def restart_nbfc():
     subprocess.run(
         ["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+    ensure_ec_sys_write_support()
 
     try:
         os.makedirs("/etc/nbfc", exist_ok=True)
@@ -447,6 +480,21 @@ NBFC_PRESTART_PAYLOAD = r"""#!/bin/sh
 if ! grep -q -E "7Y30|m3-7Y30|8100Y|m3-8100Y" /proc/cpuinfo 2>/dev/null; then
     echo "[gpd-win-2-nbfc-prestart] Non-target hardware detected. Skipping NBFC execution." >&2
     exit 1
+fi
+
+# Ensure debugfs is mounted for ec_sys access
+if [ ! -d /sys/kernel/debug/ec ]; then
+    mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+fi
+
+# Ensure ec_sys is loaded with write_support=1 for EC register control
+if [ -f /sys/module/ec_sys/parameters/write_support ]; then
+    if [ "$(cat /sys/module/ec_sys/parameters/write_support 2>/dev/null)" != "Y" ] && [ "$(cat /sys/module/ec_sys/parameters/write_support 2>/dev/null)" != "1" ]; then
+        modprobe -r ec_sys 2>/dev/null || true
+        modprobe ec_sys write_support=1 2>/dev/null || true
+    fi
+else
+    modprobe ec_sys write_support=1 2>/dev/null || true
 fi
 
 rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
@@ -1047,6 +1095,20 @@ def ensure_nbfc_running():
     subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     try:
+        if not os.path.ismount("/sys/kernel/debug"):
+            subprocess.run(["mount", "-t", "debugfs", "none", "/sys/kernel/debug"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ws_path = "/sys/module/ec_sys/parameters/write_support"
+        if os.path.exists(ws_path):
+            with open(ws_path, "r") as f:
+                if f.read().strip() not in ["Y", "1"]:
+                    subprocess.run(["modprobe", "-r", "ec_sys"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["modprobe", "ec_sys", "write_support=1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["modprobe", "ec_sys", "write_support=1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    try:
         os.makedirs("/etc/nbfc", exist_ok=True)
         if not os.path.exists("/etc/nbfc/nbfc.json"):
             with open("/etc/nbfc/nbfc.json", "w") as f:
@@ -1349,6 +1411,27 @@ def run_install():
             f"# {MODEL_NAME} coretemp module config (managed by {SCRIPT_NAME})\ncoretemp\n"
         )
 
+    # Configure ec_sys module with write_support=1
+    with open("/etc/modprobe.d/ec_sys.conf", "w") as f:
+        f.write(
+            f"# {MODEL_NAME} ec_sys write support (managed by {SCRIPT_NAME})\noptions ec_sys write_support=1\n"
+        )
+    with open("/etc/modules-load.d/ec_sys.conf", "w") as f:
+        f.write(
+            f"# {MODEL_NAME} ec_sys module config (managed by {SCRIPT_NAME})\nec_sys\n"
+        )
+    # Reload ec_sys with write_support=1
+    subprocess.run(
+        ["modprobe", "-r", "ec_sys"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["modprobe", "ec_sys", "write_support=1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
     # Pre-seed default NBFC configuration so daemon can start reliably on target hardware
     os.makedirs("/etc/nbfc", exist_ok=True)
     if not os.path.exists("/etc/nbfc/nbfc.json"):
@@ -1470,6 +1553,7 @@ WantedBy=multi-user.target
         "evdev",
         "intel_lpss_pci",
         "coretemp",
+        "ec_sys",
     ]
     update_guarded_config(
         "/etc/initramfs-tools/modules", f"{MODEL_NAME} MODULES", required_modules
