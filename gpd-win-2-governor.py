@@ -215,10 +215,9 @@ def ensure_nbfc_config():
         data["SelectedConfigId"] = "GPD Win 2 (8100y)"
     # Use dev_port (/dev/port) directly to avoid Linux kernel debugfs ec_sys write_support restrictions
     data["EmbeddedControllerType"] = "dev_port"
-    # Use acpitz sensor so NBFC daemon does not crash when secondary cores (cpu1/cpu3) are offlined
-    data["FanConfigurations"] = [
-        {"Sensors": ["acpitz"], "TemperatureFilterAlgorithm": "Max"}
-    ]
+    # Filter strictly to valid nbfc-linux configuration keys
+    valid_keys = {"SelectedConfigId", "EmbeddedControllerType"}
+    data = {k: v for k, v in data.items() if k in valid_keys}
 
     try:
         with open(cfg_file, "w") as f:
@@ -520,10 +519,12 @@ fi
 
 rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
 
-# Ensure default config with dev_port EmbeddedControllerType and acpitz sensor binding exists
+# Ensure default config with dev_port EmbeddedControllerType exists
 mkdir -p /etc/nbfc
-if [ ! -f /etc/nbfc/nbfc.json ] || ! grep -q '"EmbeddedControllerType"' /etc/nbfc/nbfc.json 2>/dev/null; then
-    printf '{\n  "SelectedConfigId": "GPD Win 2 (8100y)",\n  "EmbeddedControllerType": "dev_port",\n  "FanConfigurations": [\n    {\n      "Sensors": ["acpitz"],\n      "TemperatureFilterAlgorithm": "Max"\n    }\n  ]\n}\n' > /etc/nbfc/nbfc.json
+if [ ! -f /etc/nbfc/nbfc.json ]; then
+    printf '{\n  "SelectedConfigId": "GPD Win 2 (8100y)",\n  "EmbeddedControllerType": "dev_port"\n}\n' > /etc/nbfc/nbfc.json
+elif ! grep -q '"EmbeddedControllerType"' /etc/nbfc/nbfc.json 2>/dev/null; then
+    sed -i 's/}/,\n  "EmbeddedControllerType": "dev_port"\n}/' /etc/nbfc/nbfc.json 2>/dev/null || true
 fi
 
 # Un-park cores so Intel coretemp DTS sensors are active
@@ -1101,6 +1102,30 @@ def get_nbfc_bin():
         or "nbfc"
     )
 
+def ensure_nbfc_config():
+    try:
+        os.makedirs("/etc/nbfc", exist_ok=True)
+        cfg_file = "/etc/nbfc/nbfc.json"
+        data = {}
+        if os.path.exists(cfg_file):
+            try:
+                import json
+                with open(cfg_file, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        if not data.get("SelectedConfigId"):
+            data["SelectedConfigId"] = "GPD Win 2 (8100y)"
+        data["EmbeddedControllerType"] = "dev_port"
+        valid_keys = {"SelectedConfigId", "EmbeddedControllerType"}
+        data = {k: v for k, v in data.items() if k in valid_keys}
+        import json
+        with open(cfg_file, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+    except Exception:
+        pass
+
 def is_lowpower_state_enabled():
     try:
         if os.path.exists(STATE_FILE):
@@ -1146,32 +1171,7 @@ def ensure_nbfc_running():
     except Exception:
         pass
 
-    try:
-        os.makedirs("/etc/nbfc", exist_ok=True)
-        cfg_file = "/etc/nbfc/nbfc.json"
-        data = {}
-        if os.path.exists(cfg_file):
-            try:
-                import json
-                with open(cfg_file, "r") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-        if not data.get("SelectedConfigId"):
-            data["SelectedConfigId"] = "GPD Win 2 (8100y)"
-        data["EmbeddedControllerType"] = "dev_port"
-        data["FanConfigurations"] = [
-            {
-                "Sensors": ["acpitz"],
-                "TemperatureFilterAlgorithm": "Max"
-            }
-        ]
-        import json
-        with open(cfg_file, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-    except Exception:
-        pass
+    ensure_nbfc_config()
 
     for sock in ["/run/nbfc_service.socket", "/run/nbfc_service.pid", "/var/run/nbfc_service.socket", "/var/run/nbfc_service.pid"]:
         try:
@@ -1207,7 +1207,6 @@ def ensure_nbfc_running():
 
     if running:
         try:
-            subprocess.run([nbfc_bin, "sensors", "set", "-f", "0", "-s", "acpitz", "-a", "Max"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run([nbfc_bin, "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
@@ -1563,11 +1562,6 @@ WantedBy=multi-user.target
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        subprocess.run(
-            [nbfc_bin, "sensors", "set", "-f", "0", "-s", "acpitz", "-a", "Max"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
         ensure_nbfc_config()
 
     # Step 4: Write & Compile Early Power Watchdog C binary
