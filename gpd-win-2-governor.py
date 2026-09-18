@@ -201,30 +201,104 @@ def get_nbfc_service_bin():
 
 
 def ensure_nbfc_config():
-    os.makedirs("/etc/nbfc", exist_ok=True)
-    cfg_file = "/etc/nbfc/nbfc.json"
-    data = {}
     try:
-        if os.path.exists(cfg_file):
-            with open(cfg_file, "r") as f:
-                data = json.load(f)
-    except Exception:
-        data = {}
-
-    if not data.get("SelectedConfigId"):
-        data["SelectedConfigId"] = "GPD Win 2 (8100y)"
-    # Use dev_port (/dev/port) directly to avoid Linux kernel debugfs ec_sys write_support restrictions
-    data["EmbeddedControllerType"] = "dev_port"
-    # Filter strictly to valid nbfc-linux configuration keys
-    valid_keys = {"SelectedConfigId", "EmbeddedControllerType"}
-    data = {k: v for k, v in data.items() if k in valid_keys}
-
-    try:
-        with open(cfg_file, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
+        cfg_template = """{
+  "NotebookModel": "%MODEL%",
+  "Author": "Stefan Hirschmann (adapted for GPD Win 2 ACPI thermal stability)",
+  "EcPollInterval": 1000,
+  "ReadWriteWords": false,
+  "FanConfigurations": [
+    {
+      "ReadRegister": 108,
+      "WriteRegister": 108,
+      "MinSpeedValue": 0,
+      "MaxSpeedValue": 45,
+      "ResetRequired": true,
+      "FanSpeedResetValue": 0,
+      "FanDisplayName": "CPU fan",
+      "TemperatureThresholds": [
+        {
+          "UpThreshold": 0,
+          "DownThreshold": 0,
+          "FanSpeed": 0.0
+        },
+        {
+          "UpThreshold": 55,
+          "DownThreshold": 50,
+          "FanSpeed": 40.0
+        },
+        {
+          "UpThreshold": 60,
+          "DownThreshold": 55,
+          "FanSpeed": 50.0
+        },
+        {
+          "UpThreshold": 65,
+          "DownThreshold": 60,
+          "FanSpeed": 60.0
+        },
+        {
+          "UpThreshold": 70,
+          "DownThreshold": 65,
+          "FanSpeed": 70.0
+        },
+        {
+          "UpThreshold": 75,
+          "DownThreshold": 70,
+          "FanSpeed": 85.0
+        },
+        {
+          "UpThreshold": 80,
+          "DownThreshold": 75,
+          "FanSpeed": 100.0
+        }
+      ]
+    }
+  ]
+}"""
+        for base_dir in [
+            "/etc/nbfc/configs",
+            "/usr/share/nbfc/configs",
+            "/usr/local/share/nbfc/configs",
+        ]:
+            try:
+                os.makedirs(base_dir, exist_ok=True)
+                for m in ["GPD Win 2 (8100y)", "GPD Win 2"]:
+                    m_path = f"{base_dir}/{m}.json"
+                    tmp_m = f"{m_path}.tmp.{os.getpid()}"
+                    with open(tmp_m, "w") as f:
+                        f.write(cfg_template.replace("%MODEL%", m))
+                    os.replace(tmp_m, m_path)
+            except Exception:
+                pass
     except Exception:
         pass
+
+    cfg_file = "/etc/nbfc/nbfc.json"
+    needs_write = True
+    try:
+        if os.path.exists(cfg_file) and os.path.getsize(cfg_file) > 10:
+            with open(cfg_file, "r") as f:
+                data = json.load(f)
+            if (
+                data.get("SelectedConfigId") in ["GPD Win 2 (8100y)", "GPD Win 2"]
+                and data.get("EmbeddedControllerType") == "dev_port"
+                and len(data) == 2
+            ):
+                needs_write = False
+    except Exception:
+        needs_write = True
+
+    if needs_write:
+        try:
+            os.makedirs("/etc/nbfc", exist_ok=True)
+            content = '{\n  "SelectedConfigId": "GPD Win 2 (8100y)",\n  "EmbeddedControllerType": "dev_port"\n}\n'
+            tmp_cfg = f"/etc/nbfc/nbfc.json.tmp.{os.getpid()}"
+            with open(tmp_cfg, "w") as f:
+                f.write(content)
+            os.replace(tmp_cfg, cfg_file)
+        except Exception:
+            pass
 
 
 def ensure_ec_sys_write_support():
@@ -402,7 +476,7 @@ def set_core1_state_and_verify_nbfc(online):
             stderr=subprocess.DEVNULL,
         )
 
-    time.sleep(0.2)
+    time.sleep(1.2)
     nbfc_bin = get_nbfc_bin()
     try:
         res = subprocess.run(
@@ -455,7 +529,7 @@ def run_governor():
     while True:
         try:
             current_time = time.time()
-            if current_time - last_nbfc_check > 15:
+            if current_time - last_nbfc_check > 2:
                 nbfc_bin = get_nbfc_bin()
                 res = subprocess.run(
                     [nbfc_bin, "status"],
@@ -610,12 +684,127 @@ fi
 
 rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
 
-# Ensure default config with dev_port EmbeddedControllerType exists
-mkdir -p /etc/nbfc
-if [ ! -f /etc/nbfc/nbfc.json ]; then
-    printf '{\n  "SelectedConfigId": "GPD Win 2 (8100y)",\n  "EmbeddedControllerType": "dev_port"\n}\n' > /etc/nbfc/nbfc.json
-elif ! grep -q '"EmbeddedControllerType"' /etc/nbfc/nbfc.json 2>/dev/null; then
-    sed -i 's/}/,\n  "EmbeddedControllerType": "dev_port"\n}/' /etc/nbfc/nbfc.json 2>/dev/null || true
+# Ensure default config with dev_port and acpitz-bound model configs exists
+mkdir -p /etc/nbfc/configs
+cat << 'EOF' > "/etc/nbfc/configs/GPD Win 2 (8100y).json.tmp"
+{
+  "NotebookModel": "GPD Win 2 (8100y)",
+  "Author": "Stefan Hirschmann (adapted for GPD Win 2 ACPI thermal stability)",
+  "EcPollInterval": 1000,
+  "ReadWriteWords": false,
+  "FanConfigurations": [
+    {
+      "ReadRegister": 108,
+      "WriteRegister": 108,
+      "MinSpeedValue": 0,
+      "MaxSpeedValue": 45,
+      "ResetRequired": true,
+      "FanSpeedResetValue": 0,
+      "FanDisplayName": "CPU fan",
+      "TemperatureThresholds": [
+        {
+          "UpThreshold": 0,
+          "DownThreshold": 0,
+          "FanSpeed": 0.0
+        },
+        {
+          "UpThreshold": 55,
+          "DownThreshold": 50,
+          "FanSpeed": 40.0
+        },
+        {
+          "UpThreshold": 60,
+          "DownThreshold": 55,
+          "FanSpeed": 50.0
+        },
+        {
+          "UpThreshold": 65,
+          "DownThreshold": 60,
+          "FanSpeed": 60.0
+        },
+        {
+          "UpThreshold": 70,
+          "DownThreshold": 65,
+          "FanSpeed": 70.0
+        },
+        {
+          "UpThreshold": 75,
+          "DownThreshold": 70,
+          "FanSpeed": 85.0
+        },
+        {
+          "UpThreshold": 80,
+          "DownThreshold": 75,
+          "FanSpeed": 100.0
+        }
+      ]
+    }
+  ]
+}
+EOF
+mv -f "/etc/nbfc/configs/GPD Win 2 (8100y).json.tmp" "/etc/nbfc/configs/GPD Win 2 (8100y).json"
+
+cat << 'EOF' > "/etc/nbfc/configs/GPD Win 2.json.tmp"
+{
+  "NotebookModel": "GPD Win 2",
+  "Author": "Stefan Hirschmann (adapted for GPD Win 2 ACPI thermal stability)",
+  "EcPollInterval": 1000,
+  "ReadWriteWords": false,
+  "FanConfigurations": [
+    {
+      "ReadRegister": 108,
+      "WriteRegister": 108,
+      "MinSpeedValue": 0,
+      "MaxSpeedValue": 45,
+      "ResetRequired": true,
+      "FanSpeedResetValue": 0,
+      "FanDisplayName": "CPU fan",
+      "TemperatureThresholds": [
+        {
+          "UpThreshold": 0,
+          "DownThreshold": 0,
+          "FanSpeed": 0.0
+        },
+        {
+          "UpThreshold": 55,
+          "DownThreshold": 50,
+          "FanSpeed": 40.0
+        },
+        {
+          "UpThreshold": 60,
+          "DownThreshold": 55,
+          "FanSpeed": 50.0
+        },
+        {
+          "UpThreshold": 65,
+          "DownThreshold": 60,
+          "FanSpeed": 60.0
+        },
+        {
+          "UpThreshold": 70,
+          "DownThreshold": 65,
+          "FanSpeed": 70.0
+        },
+        {
+          "UpThreshold": 75,
+          "DownThreshold": 70,
+          "FanSpeed": 85.0
+        },
+        {
+          "UpThreshold": 80,
+          "DownThreshold": 75,
+          "FanSpeed": 100.0
+        }
+      ]
+    }
+  ]
+}
+EOF
+mv -f "/etc/nbfc/configs/GPD Win 2.json.tmp" "/etc/nbfc/configs/GPD Win 2.json" 
+
+if [ ! -f /etc/nbfc/nbfc.json ] || [ ! -s /etc/nbfc/nbfc.json ] || ! grep -q '"EmbeddedControllerType"' /etc/nbfc/nbfc.json 2>/dev/null; then
+    printf '{\n  "SelectedConfigId": "GPD Win 2 (8100y)",\n  "EmbeddedControllerType": "dev_port"\n}\n' > /etc/nbfc/nbfc.json.tmp
+    mv -f /etc/nbfc/nbfc.json.tmp /etc/nbfc/nbfc.json
 fi
 
 # Un-park cores so Intel coretemp DTS sensors are active
@@ -1195,27 +1384,96 @@ def get_nbfc_bin():
 
 def ensure_nbfc_config():
     try:
-        os.makedirs("/etc/nbfc", exist_ok=True)
-        cfg_file = "/etc/nbfc/nbfc.json"
-        data = {}
-        if os.path.exists(cfg_file):
+        cfg_template = '''{
+  "NotebookModel": "%MODEL%",
+  "Author": "Stefan Hirschmann (adapted for GPD Win 2 ACPI thermal stability)",
+  "EcPollInterval": 1000,
+  "ReadWriteWords": false,
+  "FanConfigurations": [
+    {
+      "ReadRegister": 108,
+      "WriteRegister": 108,
+      "MinSpeedValue": 0,
+      "MaxSpeedValue": 45,
+      "ResetRequired": true,
+      "FanSpeedResetValue": 0,
+      "FanDisplayName": "CPU fan",
+      "TemperatureThresholds": [
+        {
+          "UpThreshold": 0,
+          "DownThreshold": 0,
+          "FanSpeed": 0.0
+        },
+        {
+          "UpThreshold": 55,
+          "DownThreshold": 50,
+          "FanSpeed": 40.0
+        },
+        {
+          "UpThreshold": 60,
+          "DownThreshold": 55,
+          "FanSpeed": 50.0
+        },
+        {
+          "UpThreshold": 65,
+          "DownThreshold": 60,
+          "FanSpeed": 60.0
+        },
+        {
+          "UpThreshold": 70,
+          "DownThreshold": 65,
+          "FanSpeed": 70.0
+        },
+        {
+          "UpThreshold": 75,
+          "DownThreshold": 70,
+          "FanSpeed": 85.0
+        },
+        {
+          "UpThreshold": 80,
+          "DownThreshold": 75,
+          "FanSpeed": 100.0
+        }
+      ]
+    }
+  ]
+}'''
+        for base_dir in ["/etc/nbfc/configs", "/usr/share/nbfc/configs", "/usr/local/share/nbfc/configs"]:
             try:
-                import json
-                with open(cfg_file, "r") as f:
-                    data = json.load(f)
+                os.makedirs(base_dir, exist_ok=True)
+                for m in ["GPD Win 2 (8100y)", "GPD Win 2"]:
+                    m_path = f"{base_dir}/{m}.json"
+                    tmp_m = f"{m_path}.tmp.{os.getpid()}"
+                    with open(tmp_m, "w") as f:
+                        f.write(cfg_template.replace("%MODEL%", m))
+                    os.replace(tmp_m, m_path)
             except Exception:
-                data = {}
-        if not data.get("SelectedConfigId"):
-            data["SelectedConfigId"] = "GPD Win 2 (8100y)"
-        data["EmbeddedControllerType"] = "dev_port"
-        valid_keys = {"SelectedConfigId", "EmbeddedControllerType"}
-        data = {k: v for k, v in data.items() if k in valid_keys}
-        import json
-        with open(cfg_file, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
+                pass
     except Exception:
         pass
+
+    cfg_file = "/etc/nbfc/nbfc.json"
+    needs_write = True
+    try:
+        if os.path.exists(cfg_file) and os.path.getsize(cfg_file) > 10:
+            import json
+            with open(cfg_file, "r") as f:
+                data = json.load(f)
+            if data.get("SelectedConfigId") in ["GPD Win 2 (8100y)", "GPD Win 2"] and data.get("EmbeddedControllerType") == "dev_port" and len(data) == 2:
+                needs_write = False
+    except Exception:
+        needs_write = True
+
+    if needs_write:
+        try:
+            os.makedirs("/etc/nbfc", exist_ok=True)
+            content = '{\n  "SelectedConfigId": "GPD Win 2 (8100y)",\n  "EmbeddedControllerType": "dev_port"\n}\n'
+            tmp_cfg = f"/etc/nbfc/nbfc.json.tmp.{os.getpid()}"
+            with open(tmp_cfg, "w") as f:
+                f.write(content)
+            os.replace(tmp_cfg, cfg_file)
+        except Exception:
+            pass
 
 def is_lowpower_state_enabled():
     try:
@@ -1656,25 +1914,14 @@ WantedBy=multi-user.target
         stderr=subprocess.DEVNULL,
     )
 
+    ensure_nbfc_config()
+
     if is_target_hardware():
         subprocess.run(
             ["systemctl", "start", "nbfc_service.service"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(1)
-        res = subprocess.run(
-            [nbfc_bin, "config", "--set", "GPD Win 2 (8100y)"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if res.returncode != 0:
-            subprocess.run(
-                [nbfc_bin, "config", "--set", "GPD Win 2"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        ensure_nbfc_config()
 
     # Step 4: Write & Compile Early Power Watchdog C binary
     print("[4/9] Compiling namespaced early_power_watchdog C micro-daemon...")
