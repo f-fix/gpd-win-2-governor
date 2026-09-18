@@ -215,6 +215,10 @@ def ensure_nbfc_config():
         data["SelectedConfigId"] = "GPD Win 2 (8100y)"
     # Use dev_port (/dev/port) directly to avoid Linux kernel debugfs ec_sys write_support restrictions
     data["EmbeddedControllerType"] = "dev_port"
+    # Use acpitz sensor so NBFC daemon does not crash when secondary cores (cpu1/cpu3) are offlined
+    data["FanConfigurations"] = [
+        {"Sensors": ["acpitz"], "TemperatureFilterAlgorithm": "Max"}
+    ]
 
     try:
         with open(cfg_file, "w") as f:
@@ -261,7 +265,7 @@ def restart_nbfc():
     if not is_target_hardware():
         return False
 
-    saved_state = check_core1_hardware_state()
+    saved_state = check_core1_hardware_state() and not is_lowpower_state_enabled()
     set_core1_state(True)
     subprocess.run(
         ["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -516,14 +520,10 @@ fi
 
 rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
 
-# Ensure default config with dev_port EmbeddedControllerType exists
+# Ensure default config with dev_port EmbeddedControllerType and acpitz sensor binding exists
 mkdir -p /etc/nbfc
-if [ -f /etc/nbfc/nbfc.json ]; then
-    if ! grep -q '"EmbeddedControllerType"' /etc/nbfc/nbfc.json 2>/dev/null; then
-        sed -i 's/}/,\n  "EmbeddedControllerType": "dev_port"\n}/' /etc/nbfc/nbfc.json 2>/dev/null || true
-    fi
-else
-    printf '{\n  "SelectedConfigId": "GPD Win 2 (8100y)",\n  "EmbeddedControllerType": "dev_port"\n}\n' > /etc/nbfc/nbfc.json
+if [ ! -f /etc/nbfc/nbfc.json ] || ! grep -q '"EmbeddedControllerType"' /etc/nbfc/nbfc.json 2>/dev/null; then
+    printf '{\n  "SelectedConfigId": "GPD Win 2 (8100y)",\n  "EmbeddedControllerType": "dev_port",\n  "FanConfigurations": [\n    {\n      "Sensors": ["acpitz"],\n      "TemperatureFilterAlgorithm": "Max"\n    }\n  ]\n}\n' > /etc/nbfc/nbfc.json
 fi
 
 # Un-park cores so Intel coretemp DTS sensors are active
@@ -1101,6 +1101,22 @@ def get_nbfc_bin():
         or "nbfc"
     )
 
+def is_lowpower_state_enabled():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                return f.read().strip().lower() == "on"
+    except Exception:
+        pass
+    return False
+
+def check_core1_hardware_state():
+    try:
+        with open("/sys/devices/system/cpu/cpu1/online", "r") as f:
+            return f.read().strip() == "1"
+    except Exception:
+        return True
+
 def ensure_nbfc_running():
     nbfc_bin = get_nbfc_bin()
     try:
@@ -1111,6 +1127,7 @@ def ensure_nbfc_running():
     except Exception:
         pass
 
+    saved_state = check_core1_hardware_state() and not is_lowpower_state_enabled()
     print("NBFC unresponsive. Bringing cores online to re-bind coretemp sensors...")
     set_core1_state(True)
     subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1143,6 +1160,12 @@ def ensure_nbfc_running():
         if not data.get("SelectedConfigId"):
             data["SelectedConfigId"] = "GPD Win 2 (8100y)"
         data["EmbeddedControllerType"] = "dev_port"
+        data["FanConfigurations"] = [
+            {
+                "Sensors": ["acpitz"],
+                "TemperatureFilterAlgorithm": "Max"
+            }
+        ]
         import json
         with open(cfg_file, "w") as f:
             json.dump(data, f, indent=2)
@@ -1184,9 +1207,15 @@ def ensure_nbfc_running():
 
     if running:
         try:
+            subprocess.run([nbfc_bin, "sensors", "set", "-f", "0", "-s", "acpitz", "-a", "Max"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run([nbfc_bin, "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
+
+    if not saved_state:
+        set_core1_state(False)
+
+    if running:
         return True
     else:
         print("[ERROR] Failed to start or communicate with NoteBook FanControl (NBFC) daemon.")
@@ -1194,6 +1223,8 @@ def ensure_nbfc_running():
 
 def show_status():
     print(f"--- {HARDWARE_MODEL} Power Status (Managed by {SCRIPT_PARENT}) ---")
+    nbfc_ok = ensure_nbfc_running()
+
     persisted = "off"
     try:
         if os.path.exists(STATE_FILE):
@@ -1232,7 +1263,6 @@ def show_status():
         pass
 
     print("--- NoteBook FanControl (NBFC) Status ---")
-    nbfc_ok = ensure_nbfc_running()
     nbfc_bin = get_nbfc_bin()
     if nbfc_bin:
         try:
@@ -1533,6 +1563,11 @@ WantedBy=multi-user.target
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        subprocess.run(
+            [nbfc_bin, "sensors", "set", "-f", "0", "-s", "acpitz", "-a", "Max"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         ensure_nbfc_config()
 
     # Step 4: Write & Compile Early Power Watchdog C binary
