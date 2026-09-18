@@ -200,6 +200,30 @@ def get_nbfc_service_bin():
     )
 
 
+def ensure_nbfc_config():
+    os.makedirs("/etc/nbfc", exist_ok=True)
+    cfg_file = "/etc/nbfc/nbfc.json"
+    data = {}
+    try:
+        if os.path.exists(cfg_file):
+            with open(cfg_file, "r") as f:
+                data = json.load(f)
+    except Exception:
+        data = {}
+
+    if not data.get("SelectedConfigId"):
+        data["SelectedConfigId"] = "GPD Win 2 (8100y)"
+    # Use dev_port (/dev/port) directly to avoid Linux kernel debugfs ec_sys write_support restrictions
+    data["EmbeddedControllerType"] = "dev_port"
+
+    try:
+        with open(cfg_file, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+    except Exception:
+        pass
+
+
 def ensure_ec_sys_write_support():
     try:
         if not os.path.ismount("/sys/kernel/debug"):
@@ -243,14 +267,7 @@ def restart_nbfc():
         ["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     ensure_ec_sys_write_support()
-
-    try:
-        os.makedirs("/etc/nbfc", exist_ok=True)
-        if not os.path.exists("/etc/nbfc/nbfc.json"):
-            with open("/etc/nbfc/nbfc.json", "w") as f:
-                f.write('{\n  "SelectedConfigId": "GPD Win 2 (8100y)"\n}\n')
-    except Exception:
-        pass
+    ensure_nbfc_config()
 
     for sock in [
         "/run/nbfc_service.socket",
@@ -499,10 +516,14 @@ fi
 
 rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
 
-# Ensure default config exists so daemon does not fail immediately
-if [ ! -f /etc/nbfc/nbfc.json ]; then
-    mkdir -p /etc/nbfc
-    printf '{\n  "SelectedConfigId": "GPD Win 2 (8100y)"\n}\n' > /etc/nbfc/nbfc.json
+# Ensure default config with dev_port EmbeddedControllerType exists
+mkdir -p /etc/nbfc
+if [ -f /etc/nbfc/nbfc.json ]; then
+    if ! grep -q '"EmbeddedControllerType"' /etc/nbfc/nbfc.json 2>/dev/null; then
+        sed -i 's/}/,\n  "EmbeddedControllerType": "dev_port"\n}/' /etc/nbfc/nbfc.json 2>/dev/null || true
+    fi
+else
+    printf '{\n  "SelectedConfigId": "GPD Win 2 (8100y)",\n  "EmbeddedControllerType": "dev_port"\n}\n' > /etc/nbfc/nbfc.json
 fi
 
 # Un-park cores so Intel coretemp DTS sensors are active
@@ -1110,9 +1131,22 @@ def ensure_nbfc_running():
 
     try:
         os.makedirs("/etc/nbfc", exist_ok=True)
-        if not os.path.exists("/etc/nbfc/nbfc.json"):
-            with open("/etc/nbfc/nbfc.json", "w") as f:
-                f.write('{\n  "SelectedConfigId": "GPD Win 2 (8100y)"\n}\n')
+        cfg_file = "/etc/nbfc/nbfc.json"
+        data = {}
+        if os.path.exists(cfg_file):
+            try:
+                import json
+                with open(cfg_file, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        if not data.get("SelectedConfigId"):
+            data["SelectedConfigId"] = "GPD Win 2 (8100y)"
+        data["EmbeddedControllerType"] = "dev_port"
+        import json
+        with open(cfg_file, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
     except Exception:
         pass
 
@@ -1433,10 +1467,7 @@ def run_install():
     )
 
     # Pre-seed default NBFC configuration so daemon can start reliably on target hardware
-    os.makedirs("/etc/nbfc", exist_ok=True)
-    if not os.path.exists("/etc/nbfc/nbfc.json"):
-        with open("/etc/nbfc/nbfc.json", "w") as f:
-            f.write('{\n  "SelectedConfigId": "GPD Win 2 (8100y)"\n}\n')
+    ensure_nbfc_config()
 
     # Install dedicated prestart helper script
     prestart_bin = "/usr/local/bin/gpd-win-2-nbfc-prestart"
@@ -1456,7 +1487,7 @@ StartLimitIntervalSec=0
 Type=simple
 ExecCondition={prestart_bin}
 ExecStartPre={prestart_bin}
-ExecStart={nbfc_service_bin}
+ExecStart={nbfc_service_bin} --embedded-controller=dev_port
 ExecStopPost=/bin/rm -f /run/nbfc_service.socket /run/nbfc_service.pid /var/run/nbfc_service.socket /var/run/nbfc_service.pid
 Restart=always
 RestartSec=3s
@@ -1502,6 +1533,7 @@ WantedBy=multi-user.target
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        ensure_nbfc_config()
 
     # Step 4: Write & Compile Early Power Watchdog C binary
     print("[4/9] Compiling namespaced early_power_watchdog C micro-daemon...")
