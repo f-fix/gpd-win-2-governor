@@ -260,17 +260,12 @@ def ensure_ec_sys_write_support():
 
 
 def restart_nbfc():
-    """Brings cores online temporarily to guarantee coretemp sensor re-binding and restarts NBFC."""
+    """Brings cores online if needed, restarts NBFC, verifies it stayed started, and ensures the target core state is fully applied."""
     if not is_target_hardware():
         return False
 
-    saved_state = check_core1_hardware_state() and not is_lowpower_state_enabled()
-    set_core1_state(True)
-    subprocess.run(
-        ["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    ensure_ec_sys_write_support()
-    ensure_nbfc_config()
+    target_core_state = check_core1_hardware_state() and not is_lowpower_state_enabled()
+    nbfc_bin = get_nbfc_bin()
 
     for sock in [
         "/run/nbfc_service.socket",
@@ -284,7 +279,10 @@ def restart_nbfc():
         except Exception:
             pass
 
-    time.sleep(0.3)
+    ensure_ec_sys_write_support()
+    ensure_nbfc_config()
+
+    # Try restarting directly in current core configuration first
     subprocess.run(
         ["systemctl", "restart", "nbfc_service"],
         stdout=subprocess.DEVNULL,
@@ -296,7 +294,6 @@ def restart_nbfc():
         stderr=subprocess.DEVNULL,
     )
 
-    nbfc_bin = get_nbfc_bin()
     running = False
     for _ in range(6):
         time.sleep(0.25)
@@ -312,20 +309,114 @@ def restart_nbfc():
         except Exception:
             pass
 
+    # If not running, perform full core-toggle revival
     if not running:
-        try:
+        set_core1_state(True)
+        subprocess.run(
+            ["modprobe", "coretemp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.3)
+        subprocess.run(
+            ["systemctl", "restart", "nbfc_service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["systemctl", "restart", "nbfc"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        for _ in range(6):
+            time.sleep(0.25)
+            try:
+                res = subprocess.run(
+                    [nbfc_bin, "status"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if res.returncode == 0:
+                    running = True
+                    break
+            except Exception:
+                pass
+
+        if not running:
+            try:
+                subprocess.run(
+                    [nbfc_bin, "start"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(0.5)
+                res = subprocess.run(
+                    [nbfc_bin, "status"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if res.returncode == 0:
+                    running = True
+            except Exception:
+                pass
+
+    # (b) Re-apply desired target core configuration
+    if not target_core_state:
+        set_core1_state(False)
+    else:
+        set_core1_state(True)
+
+    # (a) Verify it stayed started after applying final core state
+    time.sleep(0.3)
+    try:
+        res = subprocess.run(
+            [nbfc_bin, "status"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if res.returncode == 0:
             subprocess.run(
-                [nbfc_bin, "start"],
+                [nbfc_bin, "set", "-a"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except Exception:
-            pass
+            return True
+    except Exception:
+        pass
 
-    if not saved_state:
-        time.sleep(0.5)
-        set_core1_state(False)
     return running
+
+
+def set_core1_state_and_verify_nbfc(online):
+    """Sets Core 1 (cpu1/cpu3) state and verifies that NBFC remains alive and running."""
+    current = check_core1_hardware_state()
+    if current == online:
+        return
+
+    set_core1_state(online)
+    if online:
+        subprocess.run(
+            ["modprobe", "coretemp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    time.sleep(0.2)
+    nbfc_bin = get_nbfc_bin()
+    try:
+        res = subprocess.run(
+            [nbfc_bin, "status"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if res.returncode != 0:
+            restart_nbfc()
+    except Exception:
+        restart_nbfc()
+
+    # Ensure the target core state is fully applied
+    set_core1_state(online)
 
 
 def set_nbfc_fan(mode):
@@ -378,7 +469,7 @@ def run_governor():
             # Persistent low-power mode handling
             if is_lowpower_state_enabled():
                 if core1_is_online:
-                    set_core1_state(False)
+                    set_core1_state_and_verify_nbfc(False)
                     core1_is_online = False
                 set_turbo_state(False)
                 set_scaling_governor("powersave")
@@ -401,7 +492,7 @@ def run_governor():
 
             if is_critically_low:
                 if core1_is_online:
-                    set_core1_state(False)
+                    set_core1_state_and_verify_nbfc(False)
                     core1_is_online = False
                 set_turbo_state(False)
                 turbo_is_enabled = False
@@ -410,7 +501,7 @@ def run_governor():
                 continue
 
             if temp >= CORE_DROP_TEMP and core1_is_online:
-                set_core1_state(False)
+                set_core1_state_and_verify_nbfc(False)
                 core1_is_online = False
                 forced_emergency_core_drop = True
                 last_core_drop_time = current_time
@@ -426,7 +517,7 @@ def run_governor():
                 and temp <= CORE_RESTORE_TEMP
                 and (current_time - last_core_drop_time > 15)
             ):
-                set_core1_state(True)
+                set_core1_state_and_verify_nbfc(True)
                 core1_is_online = True
                 forced_emergency_core_drop = False
                 set_nbfc_fan("auto")
@@ -437,7 +528,7 @@ def run_governor():
             if not forced_emergency_core_drop:
                 if normalized_load <= IDLE_LOAD_THRESHOLD:
                     if core1_is_online:
-                        set_core1_state(False)
+                        set_core1_state_and_verify_nbfc(False)
                         core1_is_online = False
                     if turbo_is_enabled:
                         set_turbo_state(False)
@@ -445,7 +536,7 @@ def run_governor():
                     apply_pstate_limit(30)
                 else:
                     if not core1_is_online:
-                        set_core1_state(True)
+                        set_core1_state_and_verify_nbfc(True)
                         core1_is_online = True
 
                     if temp >= TURBO_DROP_TEMP and turbo_is_enabled:
@@ -1143,7 +1234,9 @@ def check_core1_hardware_state():
         return True
 
 def ensure_nbfc_running():
+    target_core_state = check_core1_hardware_state() and not is_lowpower_state_enabled()
     nbfc_bin = get_nbfc_bin()
+
     try:
         res = subprocess.run([nbfc_bin, "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode == 0:
@@ -1152,7 +1245,6 @@ def ensure_nbfc_running():
     except Exception:
         pass
 
-    saved_state = check_core1_hardware_state() and not is_lowpower_state_enabled()
     print("NBFC unresponsive. Bringing cores online to re-bind coretemp sensors...")
     set_core1_state(True)
     subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1205,14 +1297,21 @@ def ensure_nbfc_running():
         except Exception:
             pass
 
-    if running:
-        try:
-            subprocess.run([nbfc_bin, "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-
-    if not saved_state:
+    # (b) Ensure target core state is fully applied
+    if not target_core_state:
         set_core1_state(False)
+    else:
+        set_core1_state(True)
+
+    # (a) Verify it stayed started
+    time.sleep(0.3)
+    try:
+        res = subprocess.run([nbfc_bin, "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0:
+            subprocess.run([nbfc_bin, "set", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+    except Exception:
+        pass
 
     if running:
         return True
@@ -1294,7 +1393,6 @@ elif action == "on":
     except Exception as e:
         print(f"[WARNING] Could not write persistent state to {STATE_FILE}: {e}")
 
-    ensure_nbfc_running()
     set_turbo_state(False)
     set_scaling_governor("powersave")
     apply_pstate_limit(30)
@@ -1302,6 +1400,13 @@ elif action == "on":
     if os.path.exists("/sys/class/drm/card0/gt_max_freq_mhz"):
         with open("/sys/class/drm/card0/gt_max_freq_mhz", "w") as f:
             f.write("300")
+
+    # Verify NBFC is running, restart if needed, verify it stayed started, and re-apply lowpower settings
+    ensure_nbfc_running()
+    set_core1_state(False)
+    set_turbo_state(False)
+    apply_pstate_limit(30)
+
     subprocess.run(["systemctl", "restart", "gpd-win-2-governor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("System clamped to single physical core (30% max perf, 300MHz GPU). Thermals minimized.")
     print("State saved: Low-power mode will persist across reboots.")
@@ -1316,12 +1421,19 @@ elif action == "off":
         print(f"[WARNING] Could not write persistent state to {STATE_FILE}: {e}")
 
     set_core1_state(True)
-    ensure_nbfc_running()
+    subprocess.run(["modprobe", "coretemp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if os.path.exists("/sys/class/drm/card0/gt_max_freq_mhz"):
         with open("/sys/class/drm/card0/gt_max_freq_mhz", "w") as f:
             f.write("850")
     set_turbo_state(True)
     apply_pstate_limit(100)
+
+    # Verify NBFC is running, restart if needed, verify it stayed started, and re-apply adaptive settings
+    ensure_nbfc_running()
+    set_core1_state(True)
+    set_turbo_state(True)
+    apply_pstate_limit(100)
+
     subprocess.run(["systemctl", "restart", "gpd-win-2-governor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("Adaptive governor restored via systemd.")
     print("State saved: Adaptive performance mode will persist across reboots.")
